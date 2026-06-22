@@ -115,6 +115,18 @@ namespace dxvk {
       return uint32_t(stage);
     }
 
+    static constexpr uint32_t computeStageIndex(VkShaderStageFlagBits stage) {
+      switch (stage) {
+        case VK_SHADER_STAGE_FRAGMENT_BIT:                  return 0u;
+        case VK_SHADER_STAGE_VERTEX_BIT:                    return 1u;
+        case VK_SHADER_STAGE_GEOMETRY_BIT:                  return 2u;
+        case VK_SHADER_STAGE_TESSELLATION_CONTROL_BIT:      return 3u;
+        case VK_SHADER_STAGE_TESSELLATION_EVALUATION_BIT:   return 4u;
+        case VK_SHADER_STAGE_COMPUTE_BIT:                   return 5u;
+        default:                                            return ~0u;
+      }
+    }
+
   };
 
 
@@ -149,6 +161,10 @@ namespace dxvk {
       const void*                   pShaderBytecode,
             size_t                  BytecodeLength,
       const D3D11ShaderIcbInfo&     Icb,
+      const D3D11BindingMask&       BindingMask);
+    D3D11CommonShader(
+            D3D11Device*            pDevice,
+            Rc<DxvkShader>          shader,
       const D3D11BindingMask&       BindingMask);
     ~D3D11CommonShader();
 
@@ -299,7 +315,14 @@ namespace dxvk {
       const D3D11ShaderIcbInfo&     Icb,
       const D3D11BindingMask&       BindingMask,
             D3D11CommonShader*      pShader);
-    
+
+    HRESULT GetShaderModuleSpirv(
+            D3D11Device*            pDevice,
+      const DxvkShaderHash&         ShaderKey,
+            Rc<DxvkShader>          shader,
+      const D3D11BindingMask&       BindingMask,
+            D3D11CommonShader*      pShader);
+
   private:
     
     dxvk::mutex m_mutex;

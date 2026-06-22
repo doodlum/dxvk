@@ -526,6 +526,12 @@ namespace dxvk {
             size_t                  BytecodeLength,
       const DxvkIrShaderCreateInfo& ModuleInfo);
 
+    HRESULT CreateShaderModuleFromSpirv(
+            D3D11CommonShader*      pShaderModule,
+            VkShaderStageFlagBits   Stage,
+      const void*                   pSpirvBytecode,
+            size_t                  BytecodeLength);
+
     DxvkShaderHash ComputeShaderKey(
             VkShaderStageFlagBits   Stage,
       const void*                   pShaderBytecode,

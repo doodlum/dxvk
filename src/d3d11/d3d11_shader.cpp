@@ -232,6 +232,15 @@ namespace dxvk {
   }
 
 
+  D3D11CommonShader::D3D11CommonShader(
+          D3D11Device*            pDevice,
+          Rc<DxvkShader>          shader,
+    const D3D11BindingMask&       BindingMask)
+  : m_shader(std::move(shader)), m_bindings(BindingMask) {
+    pDevice->GetDXVKDevice()->registerShader(m_shader);
+  }
+
+
   void D3D11CommonShader::CreateIrShader(
           D3D11Device*            pDevice,
     const DxvkShaderHash&         ShaderKey,
@@ -353,6 +362,27 @@ namespace dxvk {
       return E_INVALIDARG;
     }
 
+    m_modules.insert({ ShaderKey, module });
+    *pShader = std::move(module);
+    return S_OK;
+  }
+
+
+  HRESULT D3D11ShaderModuleSet::GetShaderModuleSpirv(
+          D3D11Device*            pDevice,
+    const DxvkShaderHash&         ShaderKey,
+          Rc<DxvkShader>          shader,
+    const D3D11BindingMask&       BindingMask,
+          D3D11CommonShader*      pShader) {
+    std::unique_lock<dxvk::mutex> lock(m_mutex);
+
+    auto entry = m_modules.find(ShaderKey);
+    if (entry != m_modules.end()) {
+      *pShader = entry->second;
+      return S_OK;
+    }
+
+    D3D11CommonShader module(pDevice, std::move(shader), BindingMask);
     m_modules.insert({ ShaderKey, module });
     *pShader = std::move(module);
     return S_OK;

@@ -11,6 +11,7 @@
 
 #include "../dxvk/dxvk_adapter.h"
 #include "../dxvk/dxvk_instance.h"
+#include "../dxvk/dxvk_shader_spirv.h"
 
 #include "d3d11_buffer.h"
 #include "d3d11_class_linkage.h"
@@ -792,6 +793,14 @@ namespace dxvk {
     InitReturnPtr(ppVertexShader);
     D3D11CommonShader module;
 
+    if (BytecodeLength >= 4 && *static_cast<const uint32_t*>(pShaderBytecode) == 0x07230203u) {
+      HRESULT hr = CreateShaderModuleFromSpirv(&module, VK_SHADER_STAGE_VERTEX_BIT, pShaderBytecode, BytecodeLength);
+      if (FAILED(hr)) return hr;
+      if (!ppVertexShader) return S_FALSE;
+      *ppVertexShader = ref(new D3D11VertexShader(this, module));
+      return S_OK;
+    }
+
     DxvkIrShaderCreateInfo moduleInfo = { };
     moduleInfo.options = m_shaderOptions;
 
@@ -921,7 +930,15 @@ namespace dxvk {
           ID3D11PixelShader**         ppPixelShader) {
     InitReturnPtr(ppPixelShader);
     D3D11CommonShader module;
-    
+
+    if (BytecodeLength >= 4 && *static_cast<const uint32_t*>(pShaderBytecode) == 0x07230203u) {
+      HRESULT hr = CreateShaderModuleFromSpirv(&module, VK_SHADER_STAGE_FRAGMENT_BIT, pShaderBytecode, BytecodeLength);
+      if (FAILED(hr)) return hr;
+      if (!ppPixelShader) return S_FALSE;
+      *ppPixelShader = ref(new D3D11PixelShader(this, module));
+      return S_OK;
+    }
+
     DxvkIrShaderCreateInfo moduleInfo = { };
     moduleInfo.options = m_shaderOptions;
 
@@ -999,7 +1016,15 @@ namespace dxvk {
           ID3D11ComputeShader**       ppComputeShader) {
     InitReturnPtr(ppComputeShader);
     D3D11CommonShader module;
-    
+
+    if (BytecodeLength >= 4 && *static_cast<const uint32_t*>(pShaderBytecode) == 0x07230203u) {
+      HRESULT hr = CreateShaderModuleFromSpirv(&module, VK_SHADER_STAGE_COMPUTE_BIT, pShaderBytecode, BytecodeLength);
+      if (FAILED(hr)) return hr;
+      if (!ppComputeShader) return S_FALSE;
+      *ppComputeShader = ref(new D3D11ComputeShader(this, module));
+      return S_OK;
+    }
+
     DxvkIrShaderCreateInfo moduleInfo = { };
     moduleInfo.options = m_shaderOptions;
 
@@ -2248,6 +2273,227 @@ namespace dxvk {
 
     *pShaderModule = std::move(commonShader);
     return S_OK;
+  }
+
+
+  HRESULT D3D11Device::CreateShaderModuleFromSpirv(
+          D3D11CommonShader*      pShaderModule,
+          VkShaderStageFlagBits   Stage,
+    const void*                   pSpirvBytecode,
+          size_t                  BytecodeLength) {
+    if (!BytecodeLength || !pSpirvBytecode)
+      return E_INVALIDARG;
+
+    // Compute shader hash from SPIR-V data
+    dxbc_spv::util::md5::Hasher hasher;
+    hasher.update(pSpirvBytecode, BytecodeLength);
+    hasher.finalize();
+    auto hash = hasher.getDigest();
+    DxvkShaderHash shaderKey(Stage, uint32_t(BytecodeLength),
+      hash.data.data(), hash.data.size());
+
+    // Create SPIR-V code buffer
+    SpirvCodeBuffer spirvCode(uint32_t(BytecodeLength / sizeof(uint32_t)),
+      static_cast<const uint32_t*>(pSpirvBytecode));
+
+    // Parse SPIR-V to extract descriptor bindings.
+    // DXC convention: all resources in set 0, differentiated by binding offset.
+    // CBVs: binding 0..127, SRVs: 128..255, Samplers: 256..511, UAVs: 512+
+    struct DecoInfo {
+      uint32_t set = ~0u;
+      uint32_t binding = ~0u;
+    };
+
+    struct ImageTypeInfo {
+      uint32_t dim;
+      uint32_t arrayed;
+      uint32_t sampled;
+    };
+
+    std::unordered_map<uint32_t, DecoInfo> decorations;
+    std::unordered_map<uint32_t, uint32_t> ptrToPointedType;
+    std::unordered_map<uint32_t, ImageTypeInfo> imageTypes;
+    std::unordered_map<uint32_t, uint32_t> sampledImageToImage;
+
+    struct VarInfo {
+      uint32_t id;
+      uint32_t ptrTypeId;
+    };
+    std::vector<VarInfo> variables;
+
+    bool done = false;
+
+    for (auto i = spirvCode.begin(); i != spirvCode.end() && !done; i++) {
+      auto ins = *i;
+
+      switch (ins.opCode()) {
+        case spv::OpDecorate: {
+          uint32_t id = ins.arg(1u);
+          auto decoration = spv::Decoration(ins.arg(2u));
+
+          switch (decoration) {
+            case spv::DecorationDescriptorSet:
+              decorations[id].set = ins.arg(3u);
+              break;
+            case spv::DecorationBinding:
+              decorations[id].binding = ins.arg(3u);
+              break;
+            default:
+              break;
+          }
+        } break;
+
+        case spv::OpTypePointer: {
+          ptrToPointedType[ins.arg(1u)] = ins.arg(3u);
+        } break;
+
+        case spv::OpTypeImage: {
+          imageTypes[ins.arg(1u)] = {
+            ins.arg(3u),  // Dim
+            ins.arg(5u),  // Arrayed
+            ins.arg(7u),  // Sampled
+          };
+        } break;
+
+        case spv::OpTypeSampledImage: {
+          sampledImageToImage[ins.arg(1u)] = ins.arg(2u);
+        } break;
+
+        case spv::OpVariable: {
+          uint32_t storageClass = ins.arg(3u);
+          if (storageClass == spv::StorageClassUniformConstant
+           || storageClass == spv::StorageClassUniform
+           || storageClass == spv::StorageClassStorageBuffer)
+            variables.push_back({ ins.arg(2u), ins.arg(1u) });
+        } break;
+
+        case spv::OpFunction:
+          done = true;
+          break;
+
+        default:
+          break;
+      }
+    }
+
+    // Build binding info from parsed SPIR-V data
+    std::vector<DxvkBindingInfo> bindings;
+    D3D11BindingMask bindingMask;
+
+    auto resolveImageType = [&] (uint32_t typeId) -> const ImageTypeInfo* {
+      auto it = imageTypes.find(typeId);
+      if (it != imageTypes.end())
+        return &it->second;
+      auto si = sampledImageToImage.find(typeId);
+      if (si != sampledImageToImage.end()) {
+        it = imageTypes.find(si->second);
+        if (it != imageTypes.end())
+          return &it->second;
+      }
+      return nullptr;
+    };
+
+    auto dimToViewType = [] (uint32_t dim, uint32_t arrayed) -> VkImageViewType {
+      switch (dim) {
+        case spv::Dim1D:   return arrayed ? VK_IMAGE_VIEW_TYPE_1D_ARRAY : VK_IMAGE_VIEW_TYPE_1D;
+        case spv::Dim2D:   return arrayed ? VK_IMAGE_VIEW_TYPE_2D_ARRAY : VK_IMAGE_VIEW_TYPE_2D;
+        case spv::Dim3D:   return VK_IMAGE_VIEW_TYPE_3D;
+        case spv::DimCube: return arrayed ? VK_IMAGE_VIEW_TYPE_CUBE_ARRAY : VK_IMAGE_VIEW_TYPE_CUBE;
+        default:           return VK_IMAGE_VIEW_TYPE_MAX_ENUM;
+      }
+    };
+
+    constexpr uint32_t SrvShift     = 128u;
+    constexpr uint32_t SamplerShift = 256u;
+    constexpr uint32_t UavShift     = 512u;
+
+    for (const auto& var : variables) {
+      auto decoIt = decorations.find(var.id);
+      if (decoIt == decorations.end())
+        continue;
+
+      const auto& deco = decoIt->second;
+      if (deco.set == ~0u || deco.binding == ~0u)
+        continue;
+
+      uint32_t set = deco.set;
+      uint32_t binding = deco.binding;
+
+      uint32_t pointedType = 0u;
+      auto ptrIt = ptrToPointedType.find(var.ptrTypeId);
+      if (ptrIt != ptrToPointedType.end())
+        pointedType = ptrIt->second;
+
+      DxvkBindingInfo bindInfo = { };
+      bindInfo.set = set;
+      bindInfo.binding = binding;
+      bindInfo.descriptorCount = 1u;
+
+      if (binding >= UavShift) {
+        uint32_t reg = binding - UavShift;
+        auto img = resolveImageType(pointedType);
+        if (img) {
+          if (img->dim == spv::DimBuffer) {
+            bindInfo.descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_TEXEL_BUFFER;
+            bindInfo.viewType = VK_IMAGE_VIEW_TYPE_MAX_ENUM;
+          } else {
+            bindInfo.descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE;
+            bindInfo.viewType = dimToViewType(img->dim, img->arrayed);
+          }
+        } else {
+          bindInfo.descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
+          bindInfo.viewType = VK_IMAGE_VIEW_TYPE_MAX_ENUM;
+        }
+        bindInfo.access = VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT;
+        bindInfo.resourceIndex = D3D11ShaderResourceMapping::computeUavBinding(Stage, reg);
+        bindingMask.setUav(reg);
+      } else if (binding >= SamplerShift) {
+        uint32_t reg = binding - SamplerShift;
+        bindInfo.descriptorType = VK_DESCRIPTOR_TYPE_SAMPLER;
+        bindInfo.viewType = VK_IMAGE_VIEW_TYPE_MAX_ENUM;
+        bindInfo.access = 0u;
+        bindInfo.resourceIndex = D3D11ShaderResourceMapping::computeSamplerBinding(Stage, reg);
+        bindingMask.setSampler(reg);
+      } else if (binding >= SrvShift) {
+        uint32_t reg = binding - SrvShift;
+        auto img = resolveImageType(pointedType);
+        if (img) {
+          if (img->dim == spv::DimBuffer) {
+            bindInfo.descriptorType = VK_DESCRIPTOR_TYPE_UNIFORM_TEXEL_BUFFER;
+            bindInfo.viewType = VK_IMAGE_VIEW_TYPE_MAX_ENUM;
+          } else {
+            bindInfo.descriptorType = VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE;
+            bindInfo.viewType = dimToViewType(img->dim, img->arrayed);
+          }
+        } else {
+          bindInfo.descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
+          bindInfo.viewType = VK_IMAGE_VIEW_TYPE_MAX_ENUM;
+        }
+        bindInfo.access = VK_ACCESS_SHADER_READ_BIT;
+        bindInfo.resourceIndex = D3D11ShaderResourceMapping::computeSrvBinding(Stage, reg);
+        bindingMask.setSrv(reg);
+      } else {
+        bindInfo.descriptorType = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER;
+        bindInfo.viewType = VK_IMAGE_VIEW_TYPE_MAX_ENUM;
+        bindInfo.access = VK_ACCESS_UNIFORM_READ_BIT;
+        bindInfo.flags = DxvkDescriptorFlag::UniformBuffer;
+        bindInfo.resourceIndex = D3D11ShaderResourceMapping::computeCbvBinding(Stage, binding);
+        bindingMask.setCbv(binding);
+      }
+
+      bindings.push_back(bindInfo);
+    }
+
+    // Create the SPIR-V shader object
+    DxvkSpirvShaderCreateInfo createInfo = { };
+    createInfo.bindingCount = uint32_t(bindings.size());
+    createInfo.bindings = bindings.data();
+    createInfo.debugName = shaderKey.toString();
+
+    Rc<DxvkShader> shader = new DxvkSpirvShader(createInfo, std::move(spirvCode));
+
+    return m_shaderModules.GetShaderModuleSpirv(this,
+      shaderKey, std::move(shader), bindingMask, pShaderModule);
   }
 
 
