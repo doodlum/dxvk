@@ -146,6 +146,19 @@ namespace dxvk {
       const Rc<DxvkLatencyTracker>& tracker);
 
     /**
+     * \brief Marks this swapchain as owned by an external frame-generation layer (FFX FSR3)
+     *
+     * When set, the Presenter acts as a thin submit + hand-off: it does NOT run its own
+     * present-wait worker, does NOT acquire the next image after presenting, and signals the
+     * frame-latency event immediately on the submit thread. This leaves the external frame-gen
+     * swapchain (FFX) as the single owner of the present loop — matching the official FSR3
+     * frame-interpolation-swapchain model and avoiding a stacked-present-loop deadlock. Set
+     * automatically at swapchain creation via the dxvkSetFrameGenOwnershipQuery predicate.
+     */
+    void setFrameGenOwned(bool owned) { m_frameGenOwned.store(owned, std::memory_order_release); }
+    bool isFrameGenOwned() const { return m_frameGenOwned.load(std::memory_order_acquire); }
+
+    /**
      * \brief Changes sync interval
      *
      * Changes the Vulkan present mode as necessary.
@@ -317,6 +330,10 @@ namespace dxvk {
     dxvk::condition_variable    m_frameDrain;
     dxvk::thread                m_frameThread;
     std::queue<PresenterFrame>  m_frameQueue;
+
+    // True when an external FFX frame-generation swapchain owns the real present/acquire/pacing for
+    // m_swapchain. DXVK then submits + hands off only (no second present loop). See setFrameGenOwned.
+    std::atomic<bool>           m_frameGenOwned = { false };
 
     uint64_t                    m_lastSignaled = 0u;
     uint64_t                    m_lastCompleted = 0u;
