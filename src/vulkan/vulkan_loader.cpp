@@ -10,17 +10,29 @@
 namespace dxvk::vk {
 
   static std::pair<HMODULE, PFN_vkGetInstanceProcAddr> loadVulkanLibrary() {
-    static const std::array<const char*, 2> dllNames = {{
+    static const std::array<const char*, 3> dllNames = {{
 #ifdef _WIN32
+      // Community Shaders: route DXVK's ENTIRE Vulkan surface through NVIDIA Streamline's interposer so
+      // SL (DLSS / DLSS-G / Reflex) hooks vkCreateInstance/Device/present/acquire and owns the per-frame
+      // frame-generation contract itself — exactly as the official SL Vulkan sample does. sl.interposer.dll
+      // forwards every call to the real driver, so it is a transparent passthrough when no SL feature is
+      // active (FSR-FG and the no-FG path are unaffected). It is loaded first; if absent (or it fails to
+      // resolve vkGetInstanceProcAddr) we fall through to the real loader below. The interposer itself
+      // loads the genuine "vulkan-1.dll" (from System32) to forward to, so there is no name collision.
+      "sl.interposer.dll",
       "winevulkan.dll",
       "vulkan-1.dll",
 #else
       "libvulkan.so",
       "libvulkan.so.1",
+      nullptr,
 #endif
     }};
 
     for (auto dllName : dllNames) {
+      if (!dllName)
+        continue;
+
       HMODULE library = LoadLibraryA(dllName);
 
       if (!library)
