@@ -20,6 +20,20 @@ namespace dxvk {
     g_dxvkFrameGenOwnsSwapchain.store(query, std::memory_order_release);
   }
 
+  // One-shot request to recreate the Vulkan swapchain on the next acquire. Community Shaders pokes this
+  // when switching frame-generation method from DLSS-G back to FSR: sl.dlss_g's present proxy is sticky
+  // and bypasses the Vulkan present hooks, so FSR can never return VK_SUBOPTIMAL to trigger a recreate.
+  // Forcing DXVK's own (internal) swapchain recreate here is safe — it preserves the D3D11 back buffers
+  // (DXVK blits them onto the fresh Vulkan swapchain) and re-runs vkCreate/DestroySwapchainKHR, letting
+  // dlss_g release its proxy (its destroy hook fires) and the FFX FG layer wrap the new swapchain.
+  std::atomic<bool> g_dxvkForceSwapchainRecreate = { false };
+
+  // Exported (see src/d3d11/d3d11.def) so CS can request the recreate from csd3d11.dll. extern "C"
+  // keeps the symbol unmangled. Consumed at the next Presenter::updateSwapChain (under the surface lock).
+  extern "C" void dxvkRequestSwapchainRecreate() {
+    g_dxvkForceSwapchainRecreate.store(true, std::memory_order_release);
+  }
+
   const std::array<std::pair<VkColorSpaceKHR, VkColorSpaceKHR>, 2> Presenter::s_colorSpaceFallbacks = {{
     { VK_COLOR_SPACE_EXTENDED_SRGB_LINEAR_EXT, VK_COLOR_SPACE_HDR10_ST2084_EXT },
 
@@ -171,9 +185,17 @@ namespace dxvk {
       }
     }
 
-    // Set dynamic present mode for the next frame if possible
-    if (!m_dynamicModes.empty())
-      m_presentMode = m_dynamicModes.at(m_preferredSyncInterval ? 1u : 0u); 
+    // Set dynamic present mode for the next frame if possible. Clamp the index to the actual count:
+    // an externally-wrapped swapchain (FFX frame-generation) can expose only ONE dynamic present mode,
+    // and the bare .at(1) for a non-zero sync interval then throws std::out_of_range ("invalid vector
+    // subscript") and crashes the present thread. Falling back to mode 0 just drops the vsync-interval
+    // distinction for that frame, which is harmless.
+    if (!m_dynamicModes.empty()) {
+      size_t modeIndex = (m_preferredSyncInterval ? 1u : 0u);
+      if (modeIndex >= m_dynamicModes.size())
+        modeIndex = m_dynamicModes.size() - 1u;
+      m_presentMode = m_dynamicModes.at(modeIndex);
+    }
 
     // Return relevant Vulkan objects for the acquired image
     sync = m_semaphores.at(m_frameIndex);
@@ -590,6 +612,12 @@ namespace dxvk {
 
 
   void Presenter::updateSwapChain() {
+    // Honour a one-shot external recreate request (CS frame-gen method switch — see
+    // g_dxvkForceSwapchainRecreate above). Treated as a dirty surface so the swapchain is fully torn
+    // down and rebuilt, evicting any sticky external present proxy (sl.dlss_g) on the way.
+    if (g_dxvkForceSwapchainRecreate.exchange(false, std::memory_order_acq_rel))
+      m_dirtySurface = true;
+
     if (m_dirtySurface || m_dirtySwapchain) {
       destroySwapchain();
       m_dirtySwapchain = false;

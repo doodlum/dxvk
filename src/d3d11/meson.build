@@ -70,7 +70,11 @@ d3d11_ld_args      = []
 d3d11_link_depends = []
 
 if platform == 'windows'
-  d3d11_dxgi_deps = [ lib_gdi32, lib_dxgi ]
+  # Link DXVK's OWN dxgi target (dxgi_dep) rather than the system dxgi import lib (lib_dxgi). Community
+  # Shaders renames the DLLs to dxvk_d3d11.dll / dxvk_dxgi.dll (dxvk_name_prefix) and loads them from a mod
+  # subfolder; linking dxgi_dep makes d3d11 import "dxvk_dxgi.dll" (per dxgi's LIBRARY directive) so it binds
+  # to our renamed dxgi instead of System32 dxgi.dll — no post-build import-name patch needed.
+  d3d11_dxgi_deps = [ lib_gdi32, dxgi_dep ]
 else
   d3d11_ld_args      += [ '-Wl,--version-script', join_paths(meson.current_source_dir(), 'd3d11.sym') ]
   d3d11_link_depends += files('d3d11.sym')

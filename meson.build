@@ -125,7 +125,12 @@ if platform == 'windows'
     )
   endif
 
-  dxvk_name_prefix = ''
+  # Community Shaders ships DXVK's d3d11/dxgi from a mod subfolder under unique base names so they don't
+  # alias the System32 copies. Emit them with a 'dxvk_' prefix natively (dxvk_d3d11.dll / dxvk_dxgi.dll) so
+  # d3d11 links against dxvk_dxgi.dll directly — no post-build import-name byte-patch (the old 'cs'-prefix
+  # scheme was constrained to 8-char names by that in-place patch). The matching .def LIBRARY directives are
+  # updated to DXVK_D3D11.DLL / DXVK_DXGI.DLL so the generated import library carries the new name.
+  dxvk_name_prefix = 'dxvk_'
   compiler_args += ['-DDXVK_WSI_WIN32']
 else
   dxvk_abi_version = '0'
