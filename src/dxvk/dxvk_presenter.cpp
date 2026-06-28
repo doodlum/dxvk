@@ -197,7 +197,16 @@ namespace dxvk {
       m_presentMode = m_dynamicModes.at(modeIndex);
     }
 
-    // Return relevant Vulkan objects for the acquired image
+    // Return relevant Vulkan objects for the acquired image.
+    // An externally-wrapped swapchain (the FFX FrameInterpolationSwapChain installed for FSR frame
+    // generation) can recreate the underlying VkSwapchainKHR out from under us, leaving m_imageIndex /
+    // m_frameIndex stale relative to our cached m_images / m_semaphores arrays — vkAcquireNextImageKHR
+    // then hands back an index that no longer fits. Guard the .at() accesses: a stale index is treated as
+    // a soft out-of-date so this present is skipped and the swapchain recreated next frame, instead of
+    // throwing std::out_of_range ("invalid vector subscript") and killing the present thread.
+    if (m_imageIndex >= m_images.size() || m_frameIndex >= m_semaphores.size())
+      return softError(VK_ERROR_OUT_OF_DATE_KHR);
+
     sync = m_semaphores.at(m_frameIndex);
     image = m_images.at(m_imageIndex);
 
