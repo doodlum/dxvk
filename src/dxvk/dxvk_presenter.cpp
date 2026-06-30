@@ -1,5 +1,7 @@
 #include <algorithm>
 #include <atomic>
+#include <cmath>
+#include <limits>
 
 #include "dxvk_device.h"
 #include "dxvk_presenter.h"
@@ -32,6 +34,29 @@ namespace dxvk {
   // keeps the symbol unmangled. Consumed at the next Presenter::updateSwapChain (under the surface lock).
   extern "C" void dxvkRequestSwapchainRecreate() {
     g_dxvkForceSwapchainRecreate.store(true, std::memory_order_release);
+  }
+
+  // Callback invoked inside recreateSwapChain() AFTER the old swapchain is destroyed and BEFORE the new one
+  // is created — i.e. while no swapchain exists. The Streamline DLSS-G guide §18 requires slSetFeatureLoaded
+  // to be called in exactly this window (bracketed by swapchain release + recreate) so the next
+  // vkCreateSwapchainKHR installs or omits DLSS-G's present proxy. CS registers a callback that toggles
+  // DLSS-G's loaded state here. Runs under m_surfaceMutex on the present/acquire thread.
+  void (*g_dxvkSwapchainTornDownCallback)() = nullptr;
+  extern "C" void dxvkSetSwapchainTornDownCallback(void (*cb)()) {
+    g_dxvkSwapchainTornDownCallback = cb;
+  }
+
+  // External frame-rate cap, in fps. Community Shaders drives this via the exported dxvkSetTargetFrameRate
+  // below to limit present rate when its own limiter owns pacing — specifically for FSR frame generation,
+  // which forces Reflex OFF (FFX paces itself) and therefore has no Reflex frame limiter to fall back on.
+  // NaN => not set by CS (the swapchain's own DXGI target governs). 0 => unlimited. >0 => explicit cap.
+  // Reconciled into each Presenter's m_fpsLimiter every present via applyExternalFrameRateLimit().
+  std::atomic<double> g_dxvkExternalFrameRate = { std::numeric_limits<double>::quiet_NaN() };
+
+  // Exported (see src/d3d11/d3d11.def) so CS can set the cap by resolving it from csd3d11.dll. extern "C"
+  // keeps the symbol unmangled. fps <= 0 means unlimited; pass a positive value to cap.
+  extern "C" void dxvkSetTargetFrameRate(double fps) {
+    g_dxvkExternalFrameRate.store(fps < 0.0 ? 0.0 : fps, std::memory_order_release);
   }
 
   const std::array<std::pair<VkColorSpaceKHR, VkColorSpaceKHR>, 2> Presenter::s_colorSpaceFallbacks = {{
@@ -340,6 +365,13 @@ namespace dxvk {
     // present-wait worker is disabled, so nothing else will ever complete this frame. Release the
     // frame-latency signal immediately on the submit thread (no DXVK fps limiter — FFX paces).
     if (m_frameGenOwned.load()) {
+      // Under full interposition every swapchain reports frame-gen-owned, so this is the ONLY present
+      // path that runs and the two delay() sites below are dead. Apply the external frame-rate cap here
+      // so CS can limit present rate when nothing else paces it — notably FSR frame generation, which
+      // forces Reflex off and so has no Reflex limiter. No-op unless CS set a cap via dxvkSetTargetFrameRate.
+      applyExternalFrameRateLimit();
+      m_fpsLimiter.delay();
+
       // FFX paces display; treat the frame as completed immediately so any path that checks the
       // present-wait bookkeeping (m_lastCompleted) is satisfied too, then release the latency signal.
       { std::lock_guard lock(m_frameMutex);
@@ -367,6 +399,7 @@ namespace dxvk {
       if (canSignal)
         m_signal->signal(frameId);
     } else {
+      applyExternalFrameRateLimit();
       m_fpsLimiter.delay();
       m_signal->signal(frameId);
 
@@ -554,7 +587,19 @@ namespace dxvk {
 
 
   void Presenter::setFrameRateLimit(double frameRate, uint32_t maxLatency) {
-    m_fpsLimiter.setTargetFrameRate(frameRate, maxLatency);
+    m_frameRateLimitLatency = maxLatency;
+
+    // An active external cap (CS) takes precedence over the swapchain's DXGI target; don't let a swapchain
+    // re-push clobber it. applyExternalFrameRateLimit() re-asserts the override each present regardless.
+    if (std::isnan(g_dxvkExternalFrameRate.load(std::memory_order_acquire)))
+      m_fpsLimiter.setTargetFrameRate(frameRate, maxLatency);
+  }
+
+
+  void Presenter::applyExternalFrameRateLimit() {
+    double external = g_dxvkExternalFrameRate.load(std::memory_order_acquire);
+    if (!std::isnan(external))
+      m_fpsLimiter.setTargetFrameRate(external, m_frameRateLimitLatency);
   }
 
 
@@ -601,6 +646,13 @@ namespace dxvk {
 
     if (m_swapchain)
       destroySwapchain();
+
+    // Swapchain is now torn down — the window in which DLSS-G may be (un)loaded (Streamline DLSS-G guide
+    // §18). The host's callback calls slSetFeatureLoaded so the createSwapChain below installs/omits the
+    // DLSS-G present proxy. No-op for ordinary recreates (resize, FSR-FG wrap) — CS only changes the
+    // desired load state on a real DLSS-G select/deselect.
+    if (g_dxvkSwapchainTornDownCallback)
+      g_dxvkSwapchainTornDownCallback();
 
     if (m_surface) {
       vr = createSwapChain();
@@ -1430,6 +1482,7 @@ namespace dxvk {
       // Apply FPS limiter here to align it as closely with scanout as we can,
       // and delay signaling the frame latency event to emulate behaviour of a
       // low refresh rate display as closely as we can.
+      applyExternalFrameRateLimit();
       m_fpsLimiter.delay();
 
       // Wake up any thread that may be waiting for the queue to become empty

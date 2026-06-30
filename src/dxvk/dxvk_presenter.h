@@ -175,6 +175,14 @@ namespace dxvk {
     void setFrameRateLimit(double frameRate, uint32_t maxLatency);
 
     /**
+     * \brief Reconciles the limiter to the external CS frame-rate override, if set
+     *
+     * Called once per present (before FpsLimiter::delay) so a cap set via the exported
+     * dxvkSetTargetFrameRate takes effect even though the swapchain never re-pushes it.
+     */
+    void applyExternalFrameRateLimit();
+
+    /**
      * \brief Sets preferred color space and format
      *
      * If the Vulkan surface does not natively support the given
@@ -340,6 +348,10 @@ namespace dxvk {
 
     alignas(CACHE_LINE_SIZE)
     FpsLimiter                  m_fpsLimiter;
+
+    // Last maxLatency the swapchain pushed via setFrameRateLimit; reused when an external frame-rate
+    // override (dxvkSetTargetFrameRate) reconciles the limiter per-present. See applyExternalFrameRateLimit.
+    uint32_t                    m_frameRateLimitLatency = 1u;
 
     bool                        m_hasGamescopeFenceSignalBug = false;
 
