@@ -58,6 +58,13 @@ namespace dxvk {
 
     /// Forced refresh rate, disable other modes
     uint32_t forceRefreshRate;
+
+    /// Fake exclusive fullscreen as borderless: when a game enters fullscreen, do NOT change the
+    /// real display mode — keep the desktop resolution/refresh and just cover the monitor with the
+    /// window, letting the swapchain scale. Required for Streamline frame generation, which needs
+    /// the native refresh headroom (a mode-set to e.g. 1080p@60 starves DLSS-G's generated frames)
+    /// and is disrupted by the exclusive-fullscreen transition. Defaults on in this build.
+    bool fakeFullscreen;
   };
   
 }
