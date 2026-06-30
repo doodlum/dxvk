@@ -65,6 +65,12 @@ namespace dxvk {
     /// the native refresh headroom (a mode-set to e.g. 1080p@60 starves DLSS-G's generated frames)
     /// and is disrupted by the exclusive-fullscreen transition. Defaults on in this build.
     bool fakeFullscreen;
+
+    /// EXPERIMENTAL: do a REAL exclusive-fullscreen mode change (keeping the game's resolution) but force
+    /// the desktop's native refresh rate instead of the game-requested one — so the swapchain is the game
+    /// resolution (the display engine stretches it to the panel) while DLSS-G keeps its refresh headroom.
+    /// Takes precedence over fakeFullscreen.
+    bool fullscreenNativeRefresh;
   };
   
 }

@@ -511,10 +511,21 @@ namespace dxvk {
 
       // Fake-fullscreen: never change the real desktop mode (see EnterFullscreenMode). Skyrim drives the
       // fullscreen resolution through ResizeTarget, so this is the path that would otherwise mode-set the
-      // display to e.g. 1080p@60 and starve DLSS-G of refresh headroom. Just keep the window covering the
-      // monitor; the swapchain scales onto it.
-      if (!m_factory->GetOptions()->fakeFullscreen)
+      // display to e.g. 1080p@60 and starve DLSS-G of refresh headroom. fullscreenNativeRefresh instead does
+      // the real mode-set at the game resolution but forces the native refresh.
+      const auto* opts = m_factory->GetOptions();
+      const bool nativeRefresh = opts->fullscreenNativeRefresh;
+      const bool fakeFullscreen = opts->fakeFullscreen && !nativeRefresh;
+      if (!fakeFullscreen) {
+        if (nativeRefresh) {
+          wsi::WsiMode desktopMode = { };
+          if (wsi::getDesktopDisplayMode(m_monitor, &desktopMode) && desktopMode.refreshRate.numerator) {
+            newDisplayMode.RefreshRate.Numerator   = desktopMode.refreshRate.numerator;
+            newDisplayMode.RefreshRate.Denominator = std::max(desktopMode.refreshRate.denominator, 1u);
+          }
+        }
         ChangeDisplayMode(output.ptr(), &newDisplayMode);
+      }
       wsi::updateFullscreenWindow(m_monitor, m_window, false);
     }
 
@@ -752,7 +763,12 @@ namespace dxvk {
     // monitor (modeSwitch forced off below) and the swapchain scales onto it. Exclusive fullscreen and
     // a reduced-refresh mode-set both break Streamline frame generation (DLSS-G needs the native refresh
     // headroom for its generated frames), so this keeps "fullscreen" working as borderless.
-    const bool fakeFullscreen = m_factory->GetOptions()->fakeFullscreen;
+    // fullscreenNativeRefresh (experimental) does a REAL mode-set at the game resolution but forces the
+    // native desktop refresh, so the swapchain is the game resolution (display engine stretches it) while
+    // DLSS-G keeps its refresh headroom. It takes precedence over fakeFullscreen.
+    const auto* dxgiOptions = m_factory->GetOptions();
+    const bool nativeRefresh = dxgiOptions->fullscreenNativeRefresh;
+    const bool fakeFullscreen = dxgiOptions->fakeFullscreen && !nativeRefresh;
 
     if (!fakeFullscreen) {
       DXGI_MODE_DESC1 displayMode = { };
@@ -765,6 +781,16 @@ namespace dxvk {
       displayMode.ScanlineOrdering = DXGI_MODE_SCANLINE_ORDER_UNSPECIFIED;
       displayMode.Scaling          = DXGI_MODE_SCALING_UNSPECIFIED;
 
+      if (nativeRefresh) {
+        wsi::WsiMode desktopMode = { };
+        if (wsi::getDesktopDisplayMode(wsi::getWindowMonitor(m_window), &desktopMode) && desktopMode.refreshRate.numerator) {
+          displayMode.RefreshRate.Numerator   = desktopMode.refreshRate.numerator;
+          displayMode.RefreshRate.Denominator = std::max(desktopMode.refreshRate.denominator, 1u);
+          Logger::info(str::format("DXGI: EnterFullscreenMode: forcing native refresh ",
+            displayMode.RefreshRate.Numerator / displayMode.RefreshRate.Denominator, " Hz"));
+        }
+      }
+
       if (FAILED(ChangeDisplayMode(output.ptr(), &displayMode))) {
         Logger::err("DXGI: EnterFullscreenMode: Failed to change display mode");
         return DXGI_ERROR_NOT_CURRENTLY_AVAILABLE;
@@ -774,8 +800,9 @@ namespace dxvk {
     // Update swap chain description
     m_descFs.Windowed = FALSE;
 
-    // Move the window so that it covers the entire output
-    bool modeSwitch = !fakeFullscreen && (m_desc.Flags & DXGI_SWAP_CHAIN_FLAG_ALLOW_MODE_SWITCH) != 0u;
+    // Move the window so that it covers the entire output. Native-refresh mode is a real fullscreen switch.
+    bool modeSwitch = (!fakeFullscreen) &&
+                      (nativeRefresh || (m_desc.Flags & DXGI_SWAP_CHAIN_FLAG_ALLOW_MODE_SWITCH) != 0u);
 
     DXGI_OUTPUT_DESC desc;
     output->GetDesc(&desc);
@@ -813,8 +840,11 @@ namespace dxvk {
     scoped_bool in_progress(m_ModeChangeInProgress);
 
     // Only restore the display mode if we actually changed it (see EnterFullscreenMode). In
-    // fake-fullscreen mode the desktop mode was never touched, so there is nothing to restore.
-    if (!m_factory->GetOptions()->fakeFullscreen && FAILED(RestoreDisplayMode(m_monitor)))
+    // fake-fullscreen mode the desktop mode was never touched, so there is nothing to restore;
+    // fullscreenNativeRefresh DID change it (real mode-set), so it must restore.
+    const auto* leaveOpts = m_factory->GetOptions();
+    const bool didModeSet = !(leaveOpts->fakeFullscreen && !leaveOpts->fullscreenNativeRefresh);
+    if (didModeSet && FAILED(RestoreDisplayMode(m_monitor)))
       Logger::warn("DXGI: LeaveFullscreenMode: Failed to restore display mode");
     
     // Reset gamma control and decouple swap chain from monitor

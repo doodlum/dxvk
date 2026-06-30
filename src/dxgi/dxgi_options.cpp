@@ -146,9 +146,14 @@ namespace dxvk {
     this->syncInterval     = config.getOption<int32_t>("dxgi.syncInterval", -1);
     this->forceRefreshRate = config.getOption<int32_t>("dxgi.forceRefreshRate", 0u);
 
-    // Fake exclusive fullscreen as borderless (no real display mode change). On by default in this
-    // Community Shaders build so Streamline frame generation keeps the native refresh headroom.
-    this->fakeFullscreen   = config.getOption<bool>("dxgi.fakeFullscreen", true);
+    // Real exclusive-fullscreen mode change at the game resolution, forced to the native refresh rate, so
+    // the swapchain is the game resolution (display engine stretches to the panel) while Streamline frame
+    // generation keeps its refresh headroom. The default fullscreen path in this Community Shaders build.
+    this->fullscreenNativeRefresh = config.getOption<bool>("dxgi.fullscreenNativeRefresh", true);
+
+    // Off-by-default escape hatch: fake exclusive fullscreen as borderless (no real display mode change).
+    // fullscreenNativeRefresh takes precedence over this when both are set.
+    this->fakeFullscreen   = config.getOption<bool>("dxgi.fakeFullscreen", false);
 
     // We don't support dcomp swapchains and some games may rely on them failing on creation
     this->enableDummyCompositionSwapchain = config.getOption<bool>("dxgi.enableDummyCompositionSwapchain", false);
