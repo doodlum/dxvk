@@ -277,17 +277,19 @@ namespace dxvk {
      * \returns The new buffer slice
      */
     Rc<DxvkResourceAllocation> allocateStorage(DxvkLocalAllocationCache* cache) {
-      DxvkAllocationInfo allocationInfo = { };
-      allocationInfo.resourceCookie = cookie();
-      allocationInfo.properties = m_properties;
+      if (unlikely(!m_storageInfoReady)) {
+        m_storageAllocInfo.resourceCookie = cookie();
+        m_storageAllocInfo.properties = m_properties;
 
-      VkBufferCreateInfo info = { VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO };
-      info.flags = m_info.flags;
-      info.usage = m_info.usage;
-      info.size = m_info.size;
-      m_sharingMode.fill(info);
+        m_storageBufferInfo.flags = m_info.flags;
+        m_storageBufferInfo.usage = m_info.usage;
+        m_storageBufferInfo.size = m_info.size;
+        m_sharingMode.fill(m_storageBufferInfo);
 
-      return m_allocator->createBufferResource(info, allocationInfo, cache);
+        m_storageInfoReady = true;
+      }
+
+      return m_allocator->createBufferResource(m_storageBufferInfo, m_storageAllocInfo, cache);
     }
 
     /**
@@ -414,6 +416,15 @@ namespace dxvk {
     DxvkResourceBufferInfo      m_bufferInfo    = { };
 
     Rc<DxvkResourceAllocation>  m_storage;
+
+    // Cached storage-allocation descriptors. These are immutable for the buffer's
+    // lifetime (derived from m_info / m_properties / m_sharingMode / cookie()), so we
+    // build them once and reuse them on every DISCARD. Skyrim maps dynamic constant
+    // buffers with WRITE_DISCARD on nearly every draw; rebuilding these two structs per
+    // call was measurable render-thread cost in the allocation subtree.
+    VkBufferCreateInfo          m_storageBufferInfo = { VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO };
+    DxvkAllocationInfo          m_storageAllocInfo  = { };
+    bool                        m_storageInfoReady  = false;
 
     dxvk::mutex                 m_viewMutex;
     std::unordered_map<DxvkBufferViewKey,

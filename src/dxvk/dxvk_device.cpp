@@ -5,6 +5,8 @@
 #include "dxvk_shader_cache.h"
 #include "dxvk_shader_ir.h"
 
+#include <fstream>
+
 namespace dxvk {
   
   DxvkDevice::DxvkDevice(
@@ -624,9 +626,45 @@ namespace dxvk {
     latencyInfo.frameId = frameId;
 
     m_submissionQueue.present(presentInfo, latencyInfo, status);
-    
-    std::lock_guard<sync::Spinlock> statLock(m_statLock);
-    m_statCounters.addCtr(DxvkStatCounter::QueuePresentCount, 1);
+
+    {
+      std::lock_guard<sync::Spinlock> statLock(m_statLock);
+      m_statCounters.addCtr(DxvkStatCounter::QueuePresentCount, 1);
+    }
+
+    // --- Skyrim workload profiling (env DXVK_STATS_LOG=<path>): per-frame counter deltas as CSV. Gated so
+    // it is a no-op unless the env var is set. getStatCounters() takes m_statLock internally, so this must run
+    // outside the scope above. ---
+    static const std::string s_statsPath = env::getEnvVar("DXVK_STATS_LOG");
+    if (!s_statsPath.empty()) {
+      static sync::Spinlock                s_logLock;
+      std::lock_guard<sync::Spinlock>      logLock(s_logLock);
+      static std::ofstream                 s_out(s_statsPath, std::ios::out | std::ios::trunc);
+      static DxvkStatCounters              s_prev;
+      static bool                          s_hdr = false;
+      DxvkStatCounters cur = getStatCounters();
+      DxvkStatCounters d = cur.diff(s_prev);
+      s_prev = cur;
+      if (s_out.is_open()) {
+        if (!s_hdr) {
+          s_out << "frame,draws,drawsMerged,dispatch,renderPasses,barriers,submits,gpuSync,gpuSyncTicks,"
+                   "gpuIdleTicks,csSync,csChunks,descSets,descHeaps,pipeGfx,pipeLib,pipeTasksDone,pipeTasksTotal\n";
+          s_hdr = true;
+        }
+        auto g = [&](DxvkStatCounter c) { return d.getCtr(c); };
+        s_out << cur.getCtr(DxvkStatCounter::QueuePresentCount) << ','
+              << g(DxvkStatCounter::CmdDrawCalls) << ',' << g(DxvkStatCounter::CmdDrawsMerged) << ','
+              << g(DxvkStatCounter::CmdDispatchCalls) << ',' << g(DxvkStatCounter::CmdRenderPassCount) << ','
+              << g(DxvkStatCounter::CmdBarrierCount) << ',' << g(DxvkStatCounter::QueueSubmitCount) << ','
+              << g(DxvkStatCounter::GpuSyncCount) << ',' << g(DxvkStatCounter::GpuSyncTicks) << ','
+              << g(DxvkStatCounter::GpuIdleTicks) << ',' << g(DxvkStatCounter::CsSyncCount) << ','
+              << g(DxvkStatCounter::CsChunkCount) << ',' << g(DxvkStatCounter::DescriptorSetCount) << ','
+              << g(DxvkStatCounter::DescriptorHeapCount) << ','
+              << cur.getCtr(DxvkStatCounter::PipeCountGraphics) << ',' << cur.getCtr(DxvkStatCounter::PipeCountLibrary) << ','
+              << cur.getCtr(DxvkStatCounter::PipeTasksDone) << ',' << cur.getCtr(DxvkStatCounter::PipeTasksTotal) << '\n';
+        s_out.flush();
+      }
+    }
   }
 
 

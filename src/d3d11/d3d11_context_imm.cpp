@@ -1044,7 +1044,7 @@ namespace dxvk {
       auto stage = D3D11ShaderType(i);
 
       for (uint32_t index : bit::BitMask(dirtyState[stage].cbvMask)) {
-        if (!m_state.cbv[stage].buffers[index].buffer.ptr())
+        if (!m_state.cbv[stage].buffers[index].buffer)
           dirtyState[stage].cbvMask &= ~(1u << index);
       }
 
@@ -1055,7 +1055,7 @@ namespace dxvk {
 
       for (uint32_t m = 0; m < dirtyState[stage].srvMask.size(); m++) {
         for (uint32_t index : bit::BitMask(dirtyState[stage].srvMask[m])) {
-          if (!m_state.srv[stage].views[index + m * 64u].ptr())
+          if (!m_state.srv[stage].views[index + m * 64u])
             dirtyState[stage].srvMask[m] &= ~(uint64_t(1u) << index);
         }
       }
