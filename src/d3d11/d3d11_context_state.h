@@ -54,10 +54,12 @@ namespace dxvk {
    * as well as the range that is actually bound to the context.
    */
   struct D3D11ConstantBufferBinding {
-    // Non-owning (Skyrim-only fork) — see D3D11IndexBufferBinding. Removes the
-    // per-bind private-ref atomics on cold buffer cache lines for constant buffers,
-    // which Skyrim sets on nearly every draw.
-    D3D11Buffer*     buffer         = nullptr;
+    // Owning: the binding must keep the resource alive. A non-owning raw pointer
+    // here is a use-after-free — Skyrim DOES release bound resources during cell
+    // streaming (objects unload while sprinting), leaving a dangling pointer that
+    // the dirty-rebind path dereferences → heap corruption. (Reverted from the
+    // non-owning fork experiment that crashed under streaming; see git history.)
+    Com<D3D11Buffer, false> buffer  = nullptr;
     UINT             constantOffset = 0;
     UINT             constantCount  = 0;
     UINT             constantBound  = 0;
@@ -85,12 +87,10 @@ namespace dxvk {
    * set of views that are potentially hazardous.
    */
   struct D3D11ShaderStageSrvBinding {
-    // Non-owning (Skyrim-only fork) — see D3D11IndexBufferBinding. Exteriors bind a huge
-    // number of shader-resource views per frame (terrain layers, grass, LOD, objects);
-    // the per-bind Com private-ref atomics were the single hottest render-thread cost in
-    // the exterior profile. Skyrim keeps every bound SRV alive for the frame, and the
-    // DxvkImageView/BufferView captured into the bind closure holds the GPU-side ref.
-    std::array<D3D11ShaderResourceView*, D3D11_COMMONSHADER_INPUT_RESOURCE_SLOT_COUNT> views = { };
+    // Owning: see D3D11ConstantBufferBinding. Streamed-out textures free their SRVs
+    // while still referenced here (and captured raw into the bind closure), so a
+    // non-owning pointer is a use-after-free during sprint/streaming.
+    std::array<Com<D3D11ShaderResourceView, false>, D3D11_COMMONSHADER_INPUT_RESOURCE_SLOT_COUNT> views = { };
     DxvkBindingSet<D3D11_COMMONSHADER_INPUT_RESOURCE_SLOT_COUNT>                           hazardous = { };
 
     uint32_t maxCount = 0;
@@ -156,19 +156,15 @@ namespace dxvk {
    * input layout, and the dynamic primitive topology.
    */
   struct D3D11VertexBufferBinding {
-    // Non-owning (Skyrim-only fork) — see D3D11IndexBufferBinding.
-    D3D11Buffer*            buffer = nullptr;
+    // Owning: see D3D11ConstantBufferBinding.
+    Com<D3D11Buffer, false> buffer = nullptr;
     UINT                    offset = 0;
     UINT                    stride = 0;
   };
-  
+
   struct D3D11IndexBufferBinding {
-    // Non-owning (Skyrim-only DXVK fork). Skyrim keeps every bound resource alive
-    // for the frame and never releases one while it is bound, and the DxvkBufferSlice
-    // captured into the EmitCs closure holds the GPU-side ref across the async handoff.
-    // Dropping the D3D11-object private ref removes 2 atomics on cold buffer cache
-    // lines per index-buffer bind (~once per draw) — the hottest render-thread cost.
-    D3D11Buffer*            buffer = nullptr;
+    // Owning: see D3D11ConstantBufferBinding.
+    Com<D3D11Buffer, false> buffer = nullptr;
     UINT                    offset = 0;
     DXGI_FORMAT             format = DXGI_FORMAT_UNKNOWN;
   };

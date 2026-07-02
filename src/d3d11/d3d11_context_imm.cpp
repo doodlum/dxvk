@@ -353,17 +353,14 @@ namespace dxvk {
       pMappedResource->RowPitch   = bufferSize;
       pMappedResource->DepthPitch = bufferSize;
 
-      // Capture the raw wrapper (keep-alive ref guarantees its lifetime) and
-      // resolve the Rc<DxvkBuffer> on the CS thread instead of paying the
-      // heavily contended refcount atomic here — this Map(DISCARD) runs once
-      // per dynamic-CB write, i.e. thousands of times per frame in Skyrim.
-      KeepBufferAlive(pResource);
-
+      // Owning buffer capture — see BindVertexBuffer. The new slice's cache-adopt
+      // fast path (dxvk_buffer.h) keeps the per-discard allocation cheap; the one
+      // Rc<DxvkBuffer> incRef here is on the buffer the app is actively mapping.
       EmitCs([
-        cBuffer      = pResource,
+        cBuffer      = pResource->GetBuffer(),
         cBufferSlice = std::move(bufferSlice)
       ] (DxvkContext* ctx) mutable {
-        ctx->invalidateBuffer(cBuffer->GetBufferRef(), std::move(cBufferSlice));
+        ctx->invalidateBuffer(cBuffer, std::move(cBufferSlice));
       });
 
       // Ignore small buffers here. These are often updated per
@@ -757,15 +754,12 @@ namespace dxvk {
       auto bufferSlice = pDstBuffer->DiscardSlice(&m_allocationCache);
       mapPtr = pDstBuffer->GetMapPtr();
 
-      // Same raw-wrapper capture as the Map(WRITE_DISCARD) fast path; the
-      // keep-alive reference covers the render->CS handoff.
-      KeepBufferAlive(pDstBuffer);
-
+      // Owning buffer capture — see BindVertexBuffer / MapBuffer.
       EmitCs([
-        cBuffer      = pDstBuffer,
+        cBuffer      = pDstBuffer->GetBuffer(),
         cBufferSlice = std::move(bufferSlice)
       ] (DxvkContext* ctx) mutable {
-        ctx->invalidateBuffer(cBuffer->GetBufferRef(), std::move(cBufferSlice));
+        ctx->invalidateBuffer(cBuffer, std::move(cBufferSlice));
       });
     } else {
       mapPtr = pDstBuffer->GetMapPtr();
