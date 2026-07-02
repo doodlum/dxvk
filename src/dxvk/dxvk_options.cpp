@@ -20,10 +20,15 @@ namespace dxvk {
     disableNvLowLatency2  = config.getOption<Tristate>("dxvk.disableNvLowLatency2",   Tristate::Auto);
     hideIntegratedGraphics = config.getOption<bool>   ("dxvk.hideIntegratedGraphics", false);
     zeroMappedMemory      = config.getOption<bool>    ("dxvk.zeroMappedMemory",       false);
-    // Skyrim fork: default FSE to allowed so fullscreen presents can bypass
-    // DWM composition (independent flip; needed for VRR/HDR and for uncapped
-    // presents to actually reach the display). Overridable via dxvk.conf.
-    allowFse              = config.getOption<bool>    ("dxvk.allowFse",               true);
+    // Skyrim fork: FSE default OFF. With FSE acquired, the plain (frame-gen-off)
+    // swapchain delivers newest-frame-wins at refresh while the FFX frame-gen
+    // wrap's inner swapchain never gets FSE (its pNext chain is stripped and the
+    // prebuilt FFX DLL has no acquire path) — the two states then present with
+    // different semantics, and every FG toggle pays an extra FSE re-acquisition
+    // recreate ~1s after the switch. Disallowing FSE everywhere keeps every
+    // swapchain on identical (tearing/immediate) presentation. Opt back in via
+    // dxvk.conf if exclusive scanout is ever preferred over consistency.
+    allowFse              = config.getOption<bool>    ("dxvk.allowFse",               false);
     deviceFilter          = config.getOption<std::string>("dxvk.deviceFilter",        "");
     lowerSinCos           = config.getOption<Tristate>("dxvk.lowerSinCos",            Tristate::Auto);
     tilerMode             = config.getOption<Tristate>("dxvk.tilerMode",              Tristate::Auto);
