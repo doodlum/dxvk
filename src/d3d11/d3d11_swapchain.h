@@ -90,6 +90,9 @@ namespace dxvk {
     void STDMETHODCALLTYPE SetTargetFrameRate(
             double                    FrameRate);
 
+    void STDMETHODCALLTYPE SetFullscreenExclusive(
+            BOOL                      Fullscreen);
+
   private:
 
     enum BindingIds : uint32_t {
@@ -121,6 +124,7 @@ namespace dxvk {
     VkColorSpaceKHR           m_colorSpace = VK_COLOR_SPACE_SRGB_NONLINEAR_KHR;
 
     double                    m_targetFrameRate = 0.0;
+    BOOL                      m_fullscreenExclusive = FALSE;
 
     dxvk::mutex               m_frameStatisticsLock;
     DXGI_VK_FRAME_STATISTICS  m_frameStatistics = { };

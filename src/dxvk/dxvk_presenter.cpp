@@ -75,12 +75,13 @@ namespace dxvk {
     m_vki(device->instance()->vki()),
     m_vkd(device->vkd()),
     m_surfaceProc(std::move(proc)) {
-    // Only enable FSE if the user explicitly opts in. On Windows, FSE
-    // is required to support VRR or HDR, but blocks alt-tabbing or
-    // overlapping windows, which breaks a number of games.
-    m_fullscreenMode = m_device->config().allowFse
-      ? VK_FULL_SCREEN_EXCLUSIVE_ALLOWED_EXT
-      : VK_FULL_SCREEN_EXCLUSIVE_DISALLOWED_EXT;
+    // Even with dxvk.allowFse enabled, swapchains START with FSE disallowed:
+    // the ALLOWED declaration disables dynamic present-mode switching (vsync
+    // toggles would recreate the swapchain) and only has meaning when the
+    // window covers a display. The DXGI layer enables it on fullscreen
+    // transitions via setFullScreenExclusiveMode. On Windows, FSE is required
+    // for VRR/HDR and for uncapped presents to bypass DWM composition.
+    m_fullscreenMode = VK_FULL_SCREEN_EXCLUSIVE_DISALLOWED_EXT;
 
     // Create Vulkan surface immediately if possible, but ignore
     // certain errors since the app window may still be in use in
@@ -582,6 +583,20 @@ namespace dxvk {
 
       if (m_dynamicModes.empty())
         m_dirtySwapchain = true;
+    }
+  }
+
+
+  void Presenter::setFullScreenExclusiveMode(VkFullScreenExclusiveEXT mode) {
+    std::lock_guard lock(m_surfaceMutex);
+
+    // FSE remains opt-in; without the option every swapchain stays disallowed.
+    if (!m_device->config().allowFse)
+      mode = VK_FULL_SCREEN_EXCLUSIVE_DISALLOWED_EXT;
+
+    if (m_fullscreenMode != mode) {
+      m_fullscreenMode = mode;
+      m_dirtySwapchain = true;
     }
   }
 
@@ -1277,6 +1292,11 @@ namespace dxvk {
         desired[numDesired++] = VK_PRESENT_MODE_IMMEDIATE_KHR;
       desired[numDesired++] = VK_PRESENT_MODE_MAILBOX_KHR;
     } else {
+      // VSync-on stays FIFO (the fallback below): MAILBOX was measured to sit
+      // outside IMMEDIATE's compatible-mode group on NVIDIA, so preferring it
+      // here destroys dynamic present-mode switching and every vsync toggle
+      // then recreates the whole swapchain (visible flash + the recreate path
+      // is this fork's most delicate code). FIFO never drops frames either.
       if (tearFree == Tristate::False)
         desired[numDesired++] = VK_PRESENT_MODE_FIFO_RELAXED_KHR;
     }

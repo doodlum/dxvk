@@ -167,6 +167,19 @@ namespace dxvk {
     void setSyncInterval(uint32_t syncInterval);
 
     /**
+     * \brief Sets the full-screen exclusive declaration for the swapchain
+     *
+     * Windowed swapchains are created with FSE disallowed: declaring ALLOWED
+     * costs dynamic present-mode switching (every sync-interval change then
+     * requires a full swapchain recreation) and only has meaning when the
+     * window covers a display. The DXGI layer calls this on fullscreen
+     * transitions, which recreate the swapchain anyway. Gated on
+     * dxvk.allowFse; marks the swapchain dirty when the mode changes.
+     * \param [in] mode Desired full-screen exclusive mode
+     */
+    void setFullScreenExclusiveMode(VkFullScreenExclusiveEXT mode);
+
+    /**
      * \brief Changes maximum frame rate
      *
      * \param [in] frameRate Target frame rate. Set

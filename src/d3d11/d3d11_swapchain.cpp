@@ -357,6 +357,18 @@ namespace dxvk {
   }
 
 
+  void STDMETHODCALLTYPE D3D11SwapChain::SetFullscreenExclusive(
+          BOOL                      Fullscreen) {
+    m_fullscreenExclusive = Fullscreen;
+
+    if (m_presenter != nullptr) {
+      m_presenter->setFullScreenExclusiveMode(Fullscreen
+        ? VK_FULL_SCREEN_EXCLUSIVE_ALLOWED_EXT
+        : VK_FULL_SCREEN_EXCLUSIVE_DISALLOWED_EXT);
+    }
+  }
+
+
   Rc<DxvkImageView> D3D11SwapChain::GetBackBufferView() {
     Rc<DxvkImage> image = GetCommonTexture(m_backBuffers[0].ptr())->GetImage();
 
@@ -518,6 +530,9 @@ namespace dxvk {
     m_presenter->setSurfaceFormat(GetSurfaceFormat(m_desc.Format));
     m_presenter->setSurfaceExtent({ m_desc.Width, m_desc.Height });
     m_presenter->setFrameRateLimit(m_targetFrameRate, GetActualFrameLatency());
+    m_presenter->setFullScreenExclusiveMode(m_fullscreenExclusive
+      ? VK_FULL_SCREEN_EXCLUSIVE_ALLOWED_EXT
+      : VK_FULL_SCREEN_EXCLUSIVE_DISALLOWED_EXT);
 
     m_latency = m_device->createLatencyTracker(m_presenter);
 

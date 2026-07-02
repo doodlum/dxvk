@@ -817,6 +817,13 @@ namespace dxvk {
     m_monitor = desc.Monitor;
     m_target  = std::move(output);
 
+    // The window now covers a display: allow full-screen exclusive on the
+    // Vulkan swapchain (VRR/HDR, compositor bypass). Windowed swapchains stay
+    // FSE-disallowed so they keep dynamic present-mode switching; the
+    // fullscreen transition recreates the swapchain anyway.
+    if (m_presenter2 != nullptr)
+      m_presenter2->SetFullscreenExclusive(TRUE);
+
     // Apply current gamma curve of the output
     DXGI_VK_MONITOR_DATA* monitorInfo = nullptr;
 
@@ -862,7 +869,12 @@ namespace dxvk {
     m_descFs.Windowed = TRUE;
     m_target  = nullptr;
     m_monitor = wsi::getWindowMonitor(m_window);
-    
+
+    // Back to windowed: disallow FSE again so the recreated swapchain
+    // regains dynamic present-mode switching.
+    if (m_presenter2 != nullptr)
+      m_presenter2->SetFullscreenExclusive(FALSE);
+
     if (!wsi::isWindow(m_window))
       return S_OK;
     

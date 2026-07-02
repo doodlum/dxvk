@@ -20,7 +20,10 @@ namespace dxvk {
     disableNvLowLatency2  = config.getOption<Tristate>("dxvk.disableNvLowLatency2",   Tristate::Auto);
     hideIntegratedGraphics = config.getOption<bool>   ("dxvk.hideIntegratedGraphics", false);
     zeroMappedMemory      = config.getOption<bool>    ("dxvk.zeroMappedMemory",       false);
-    allowFse              = config.getOption<bool>    ("dxvk.allowFse",               false);
+    // Skyrim fork: default FSE to allowed so fullscreen presents can bypass
+    // DWM composition (independent flip; needed for VRR/HDR and for uncapped
+    // presents to actually reach the display). Overridable via dxvk.conf.
+    allowFse              = config.getOption<bool>    ("dxvk.allowFse",               true);
     deviceFilter          = config.getOption<std::string>("dxvk.deviceFilter",        "");
     lowerSinCos           = config.getOption<Tristate>("dxvk.lowerSinCos",            Tristate::Auto);
     tilerMode             = config.getOption<Tristate>("dxvk.tilerMode",              Tristate::Auto);
