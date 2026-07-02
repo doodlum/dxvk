@@ -769,6 +769,7 @@ namespace dxvk {
    */
   class DxvkLocalAllocationCache {
     friend DxvkMemoryAllocator;
+    friend class DxvkBuffer;
   public:
     // Cache allocations up to 128 kiB
     constexpr static uint32_t PoolCount = 10u;
@@ -777,6 +778,33 @@ namespace dxvk {
     constexpr static VkDeviceSize MaxSize = MinSize << (PoolCount - 1u);
 
     constexpr static VkDeviceSize PoolCapacityInBytes = 4u * DxvkPageAllocator::PageSize;
+
+    // Allocations per batch. The caching protocol hands allocations around in
+    // dense slot-array batches instead of intrusive linked lists: list pops
+    // made the per-draw dynamic-buffer discard path take one serial cold-
+    // cache-line miss per allocation (the next-pointer lives inside the cold
+    // object), which profiled as the single largest render-thread cost in
+    // draw-heavy scenes. With slot arrays, pops touch a single dense line and
+    // the cold object lines can be prefetched ahead by index.
+    //
+    // Deliberately a small fixed cap (NOT PoolCapacityInBytes / MinSize =
+    // 1024): the arrays must stay cache-resident — a first cut sized them for
+    // the worst case and the resulting 16 KiB-per-pool layout made the pop
+    // itself the memory stall it was meant to remove.
+    constexpr static uint32_t BatchCapacity = 64u;
+
+    /**
+     * \brief Cached allocation slot
+     *
+     * The mapped pointer rides along with the allocation pointer (captured
+     * while the object line was warm on the freeing thread) so pops can
+     * prefetch an upcoming allocation's mapped memory ahead of the caller's
+     * write through Map(). Interleaved so one pop touches one cache line.
+     */
+    struct Slot {
+      DxvkResourceAllocation* allocation;
+      void*                   mapPtr;
+    };
 
     DxvkLocalAllocationCache() = default;
 
@@ -790,7 +818,9 @@ namespace dxvk {
       m_pools(other.m_pools) {
       other.m_allocator = nullptr;
       other.m_memoryTypes = 0u;
-      other.m_pools = { };
+
+      for (auto& pool : other.m_pools)
+        pool.count = 0u;
     }
 
     DxvkLocalAllocationCache& operator = (DxvkLocalAllocationCache&& other) {
@@ -802,7 +832,10 @@ namespace dxvk {
 
       other.m_allocator = nullptr;
       other.m_memoryTypes = 0u;
-      other.m_pools = { };
+
+      for (auto& pool : other.m_pools)
+        pool.count = 0u;
+
       return *this;
     }
 
@@ -841,17 +874,52 @@ namespace dxvk {
 
   private:
 
+    /**
+     * \brief Dense per-size-class pool
+     *
+     * Ready allocations as a slot array (LIFO). Pops never dereference the
+     * cold allocation object, and upcoming objects and their mapped memory
+     * are prefetched by index a few pops ahead of use.
+     */
+    struct Pool {
+      uint16_t count = 0u;
+      std::array<Slot, BatchCapacity> slots;
+    };
+
     DxvkMemoryAllocator*  m_allocator   = nullptr;
     uint32_t              m_memoryTypes = 0u;
 
-    std::array<DxvkResourceAllocation*, PoolCount> m_pools = { };
+    std::array<Pool, PoolCount> m_pools = { };
 
     DxvkResourceAllocation* allocateFromCache(
             VkDeviceSize                size);
 
-    DxvkResourceAllocation* assignCache(
+    /**
+     * \brief Pops an allocation slot from a pool
+     *
+     * Like allocateFromCache, but also hands the caller the mapped pointer
+     * captured at free time, so the hot Map(DISCARD) path never has to READ
+     * the cold allocation object on the render thread (its first load was
+     * the single largest remaining stall of the discard path).
+     * \param [in] size Allocation size (selects the pool)
+     * \returns The slot; allocation is nullptr if the pool is empty.
+     */
+    Slot popSlot(
+            VkDeviceSize                size);
+
+    /**
+     * \brief Appends a batch of allocations to a pool
+     *
+     * \param [in] size Allocation size (selects the pool)
+     * \param [in] slots Allocations to add
+     * \param [in] count Number of allocations
+     * \returns Number of allocations consumed; the caller
+     *    must free any leftover entries beyond that index.
+     */
+    uint32_t fillCache(
             VkDeviceSize                size,
-            DxvkResourceAllocation*     allocation);
+      const Slot*                       slots,
+            uint32_t                    count);
 
     void freeCache();
 
@@ -895,24 +963,30 @@ namespace dxvk {
     ~DxvkSharedAllocationCache();
 
     /**
-     * \brief Retrieves list of cached allocations
+     * \brief Retrieves a batch of cached allocations
      *
      * \param [in] allocationSize Required allocation size
-     * \returns Pointer to head of allocation list,
-     *    or \c nullptr if the cache is empty.
+     * \param [out] slots Receives the batch (dense slot array,
+     *    at least DxvkLocalAllocationCache::BatchCapacity elements)
+     * \returns Number of allocations in the batch, or 0 if
+     *    the cache is empty for this size class.
      */
-    DxvkResourceAllocation* getAllocationList(
-            VkDeviceSize                allocationSize);
+    uint32_t getAllocationBatch(
+            VkDeviceSize                allocationSize,
+            DxvkLocalAllocationCache::Slot* slots);
 
     /**
      * \brief Frees cacheable allocation
      *
      * \param [in] allocation Allocation to free
-     * \returns List to destroy if the cache is full. Usually,
-     *    \c nullptr if the allocation was successfully added.
+     * \param [out] overflow Receives allocations to destroy if the
+     *    cache is full (at least BatchCapacity elements).
+     * \returns Number of overflow allocations the caller must free;
+     *    usually 0 if the allocation was successfully added.
      */
-    DxvkResourceAllocation* freeAllocation(
-            DxvkResourceAllocation*     allocation);
+    uint32_t freeAllocation(
+            DxvkResourceAllocation*     allocation,
+            DxvkResourceAllocation**    overflow);
 
     /**
      * \brief Queries statistics
@@ -936,12 +1010,14 @@ namespace dxvk {
       uint16_t size = 0u;
       uint16_t capacity = 0u;
 
-      DxvkResourceAllocation* head = nullptr;
+      std::array<DxvkLocalAllocationCache::Slot, DxvkLocalAllocationCache::BatchCapacity> slots;
     };
 
     struct List {
-      DxvkResourceAllocation* head = nullptr;
+      uint16_t                count = 0u;
       int32_t                 next = -1;
+
+      std::array<DxvkLocalAllocationCache::Slot, DxvkLocalAllocationCache::BatchCapacity> slots;
     };
 
     struct Pool {
@@ -1287,6 +1363,21 @@ namespace dxvk {
     DxvkSharedAllocationCacheStats getAllocationCacheStats() const;
 
     /**
+     * \brief Queries global-buffer memory types for a usage pattern
+     *
+     * Buffer-invariant part of the suballocation eligibility check; lets
+     * DxvkBuffer precompute its allocation-cache compatibility once so the
+     * per-DISCARD hot path can pop the local cache directly.
+     * \param [in] usage Buffer usage flags
+     * \returns Memory type mask for global-buffer suballocation
+     */
+    uint32_t getGlobalBufferMemoryTypeMask(VkBufferUsageFlags usage) {
+      if (likely(!(usage & ~m_globalBufferUsageFlags)))
+        return m_globalBufferMemoryTypes;
+      return findGlobalBufferMemoryTypeMask(usage);
+    }
+
+    /**
      * \brief Queries buffer memory requirements
      *
      * Can be used to get memory requirements without having
@@ -1427,10 +1518,20 @@ namespace dxvk {
             DxvkLocalAllocationCache* cache);
 
     void freeCachedAllocations(
-            DxvkResourceAllocation* allocation);
+            DxvkResourceAllocation* const* allocations,
+            uint32_t              count);
+
+    void freeCachedAllocations(
+      const DxvkLocalAllocationCache::Slot* slots,
+            uint32_t              count);
 
     void freeCachedAllocationsLocked(
-            DxvkResourceAllocation* allocation);
+            DxvkResourceAllocation* const* allocations,
+            uint32_t              count);
+
+    void freeCachedAllocationsLocked(
+      const DxvkLocalAllocationCache::Slot* slots,
+            uint32_t              count);
 
     uint32_t countEmptyChunksInPool(
       const DxvkMemoryPool&       pool) const;

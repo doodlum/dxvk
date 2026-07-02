@@ -286,10 +286,63 @@ namespace dxvk {
         m_storageBufferInfo.size = m_info.size;
         m_sharingMode.fill(m_storageBufferInfo);
 
+        // Precompute the buffer-invariant part of the allocation-cache
+        // eligibility check (mirrors createBufferResource) so the per-DISCARD
+        // hot path below can pop the local cache without re-deriving it.
+        m_storageMemTypeBits = m_allocator->getGlobalBufferMemoryTypeMask(m_info.usage);
+        m_storageCacheable = !m_storageBufferInfo.flags
+          && m_storageAllocInfo.mode.isClear()
+          && m_storageBufferInfo.size <= DxvkLocalAllocationCache::MaxSize
+          && (m_storageAllocInfo.properties & VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT)
+          && m_storageMemTypeBits;
+
         m_storageInfoReady = true;
       }
 
+      // Fast path for per-draw dynamic-buffer discards: skip the whole
+      // createBufferResource preamble and pop the context's local cache
+      // directly. Falls through on a cache miss (roughly once per batch),
+      // where the generic path handles the refill.
+      if (likely(m_storageCacheable && cache)) {
+        if (likely(cache->m_memoryTypes && !(cache->m_memoryTypes & ~m_storageMemTypeBits))) {
+          // Cached allocations carry a pre-set refcount of 1 — adopt without
+          // an atomic RMW or any store to the (cold, cross-core) object.
+          if (DxvkResourceAllocation* allocation = cache->allocateFromCache(m_storageBufferInfo.size))
+            return Rc<DxvkResourceAllocation>::unsafeCreate(allocation);
+        }
+      }
+
       return m_allocator->createBufferResource(m_storageBufferInfo, m_storageAllocInfo, cache);
+    }
+
+    /**
+     * \brief Allocates new buffer slice for a DISCARD, without touching it
+     *
+     * Like \ref allocateStorage, but returns the slice's mapped pointer via
+     * the slot captured at free time, so the hot render-thread discard path
+     * never LOADS from the cold allocation object (its first read was the
+     * largest remaining stall of the discard path; the Rc's refcount store
+     * is absorbed by the store buffer instead of stalling retirement).
+     * \param [in] cache Optional allocation cache
+     * \param [out] mapPtr The slice's mapped pointer
+     * \returns The new buffer slice
+     */
+    Rc<DxvkResourceAllocation> allocateStorageWithMapPtr(DxvkLocalAllocationCache* cache, void** mapPtr) {
+      if (likely(m_storageInfoReady && m_storageCacheable && cache)) {
+        if (likely(cache->m_memoryTypes && !(cache->m_memoryTypes & ~m_storageMemTypeBits))) {
+          DxvkLocalAllocationCache::Slot slot = cache->popSlot(m_storageBufferInfo.size);
+
+          if (likely(slot.allocation)) {
+            // Adopt the pre-set refcount — no atomic, no cold-object store.
+            *mapPtr = slot.mapPtr;
+            return Rc<DxvkResourceAllocation>::unsafeCreate(slot.allocation);
+          }
+        }
+      }
+
+      Rc<DxvkResourceAllocation> allocation = allocateStorage(cache);
+      *mapPtr = allocation->mapPtr();
+      return allocation;
     }
 
     /**
@@ -424,6 +477,8 @@ namespace dxvk {
     // call was measurable render-thread cost in the allocation subtree.
     VkBufferCreateInfo          m_storageBufferInfo = { VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO };
     DxvkAllocationInfo          m_storageAllocInfo  = { };
+    uint32_t                    m_storageMemTypeBits = 0u;
+    bool                        m_storageCacheable  = false;
     bool                        m_storageInfoReady  = false;
 
     dxvk::mutex                 m_viewMutex;

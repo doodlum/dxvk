@@ -1,6 +1,7 @@
 #include <algorithm>
 #include <iomanip>
 #include <sstream>
+#include <xmmintrin.h>
 
 #include "../util/util_bit.h"
 
@@ -437,23 +438,65 @@ namespace dxvk {
 
   DxvkResourceAllocation* DxvkLocalAllocationCache::allocateFromCache(
           VkDeviceSize                size) {
-    uint32_t poolIndex = computePoolIndex(size);
-    DxvkResourceAllocation* allocation = m_pools[poolIndex];
-
-    if (!allocation)
-      return nullptr;
-
-    m_pools[poolIndex] = allocation->m_nextCached;
-    allocation->m_nextCached = nullptr;
-    return allocation;
+    return popSlot(size).allocation;
   }
 
 
-  DxvkResourceAllocation* DxvkLocalAllocationCache::assignCache(
-          VkDeviceSize                size,
-          DxvkResourceAllocation*     allocation) {
+  DxvkLocalAllocationCache::Slot DxvkLocalAllocationCache::popSlot(
+          VkDeviceSize                size) {
     uint32_t poolIndex = computePoolIndex(size);
-    return std::exchange(m_pools[poolIndex], allocation);
+    auto& pool = m_pools[poolIndex];
+
+    if (!pool.count)
+      return Slot { nullptr, nullptr };
+
+    Slot slot = pool.slots[--pool.count];
+
+    // Prefetch the allocation OBJECT a few pops ahead: the objects were last
+    // touched by the CS/submit thread when freed, so their first touch is a
+    // cross-core transfer; the pool arena is dense (few pages) so this stays
+    // TLB-friendly. Measured +4 FPS vs no prefetch.
+    //
+    // ⚠️ Never prefetch slot.mapPtr here — measured to HURT (~3s of render-
+    // thread time per 16s): the mapped targets are scattered across thousands
+    // of distinct 4 KiB pages, so nearly every such prefetch missed the DTLB
+    // and triggered a page walk ON THE POP, far exceeding the miss it was
+    // meant to hide.
+    if (pool.count >= 4u)
+      _mm_prefetch(reinterpret_cast<const char*>(pool.slots[pool.count - 4u].allocation), _MM_HINT_T0);
+
+    return slot;
+  }
+
+
+  uint32_t DxvkLocalAllocationCache::fillCache(
+          VkDeviceSize                size,
+    const Slot*                       slots,
+          uint32_t                    count) {
+    uint32_t poolIndex = computePoolIndex(size);
+    auto& pool = m_pools[poolIndex];
+
+    uint32_t consumed = std::min(count, uint32_t(BatchCapacity - pool.count));
+
+    for (uint32_t i = 0; i < consumed; i++)
+      pool.slots[pool.count + i] = slots[i];
+
+    // NOTE: do NOT sort the batch by mapped address — tried and measured a
+    // ~3% regression. The shared cache's LIFO order carries temporal
+    // recency (recently freed slices have warm lines and hot TLB entries),
+    // which beats the spatial-locality ordering it was traded for.
+    pool.count += uint16_t(consumed);
+
+    // Warm the tail of the pool (the next few pops) right away — the pop-time
+    // prefetch only covers steady state, not the first pops after a refill.
+    // Objects only; see allocateFromCache for why mapped pointers must never
+    // be prefetched (DTLB-walk cost).
+    uint32_t warm = std::min(uint32_t(pool.count), 4u);
+
+    for (uint32_t i = 0; i < warm; i++)
+      _mm_prefetch(reinterpret_cast<const char*>(pool.slots[pool.count - 1u - i].allocation), _MM_HINT_T0);
+
+    return consumed;
   }
 
 
@@ -491,7 +534,12 @@ namespace dxvk {
   : m_allocator(allocator) {
     for (uint32_t i = 0; i < m_pools.size(); i++) {
       VkDeviceSize size = DxvkLocalAllocationCache::computeAllocationSize(i);
-      m_freeLists[i].capacity = DxvkLocalAllocationCache::computePreferredAllocationCount(size);
+      // Batches are capped so the slot arrays stay cache-resident; the
+      // preferred count for the smallest size classes (up to 1024) is a
+      // memory-waste bound, not a batching requirement.
+      m_freeLists[i].capacity = uint16_t(std::min(
+        DxvkLocalAllocationCache::computePreferredAllocationCount(size),
+        DxvkLocalAllocationCache::BatchCapacity));
     }
 
     // Initialize unallocated list of lists
@@ -504,18 +552,19 @@ namespace dxvk {
 
   DxvkSharedAllocationCache::~DxvkSharedAllocationCache() {
     for (const auto& freeList : m_freeLists)
-      m_allocator->freeCachedAllocations(freeList.head);
+      m_allocator->freeCachedAllocations(freeList.slots.data(), freeList.size);
 
     for (const auto& list : m_lists)
-      m_allocator->freeCachedAllocations(list.head);
+      m_allocator->freeCachedAllocations(list.slots.data(), list.count);
   }
 
 
-  DxvkResourceAllocation* DxvkSharedAllocationCache::getAllocationList(
-          VkDeviceSize                allocationSize) {
+  uint32_t DxvkSharedAllocationCache::getAllocationBatch(
+          VkDeviceSize                allocationSize,
+          DxvkLocalAllocationCache::Slot* slots) {
     uint32_t poolIndex = DxvkLocalAllocationCache::computePoolIndex(allocationSize);
 
-    // If there's a list ready for us, take the whole thing
+    // If there's a batch ready for us, take the whole thing
     std::unique_lock poolLock(m_poolMutex);
     m_numRequests += 1u;
 
@@ -524,46 +573,65 @@ namespace dxvk {
 
     if (listIndex < 0) {
       m_numMisses += 1u;
-      return nullptr;
+      return 0u;
     }
 
     if (!(--pool.listCount))
       pool.drainTime = high_resolution_clock::now();
 
-    // Extract allocations and mark list as free
-    DxvkResourceAllocation* allocation = m_lists[listIndex].head;
-    pool.listIndex = m_lists[listIndex].next;
+    // Copy the batch out (dense slot array) and mark the slot as free
+    auto& list = m_lists[listIndex];
+    uint32_t count = list.count;
 
-    m_lists[listIndex].head = nullptr;
-    m_lists[listIndex].next = m_nextList;
+    for (uint32_t i = 0; i < count; i++)
+      slots[i] = list.slots[i];
+
+    pool.listIndex = list.next;
+
+    list.count = 0u;
+    list.next = m_nextList;
 
     m_nextList = listIndex;
 
     m_cacheSize -= PoolCapacityInBytes;
-    return allocation;
+    return count;
   }
 
 
-  DxvkResourceAllocation* DxvkSharedAllocationCache::freeAllocation(
-          DxvkResourceAllocation*     allocation) {
+  uint32_t DxvkSharedAllocationCache::freeAllocation(
+          DxvkResourceAllocation*     allocation,
+          DxvkResourceAllocation**    overflow) {
     uint32_t poolIndex = DxvkLocalAllocationCache::computePoolIndex(allocation->m_size);
+
+    // Local copy of the full batch: the free list can be refilled by another
+    // thread the moment m_freeMutex is released, so the batch must be staged
+    // before taking the pool lock.
+    std::array<DxvkLocalAllocationCache::Slot, DxvkLocalAllocationCache::BatchCapacity> batch;
+    uint32_t batchSize;
+
+    // Capture the mapped pointer NOW while the allocation's line is still
+    // warm on the freeing thread; consumers use it for prefetch-ahead.
+    DxvkLocalAllocationCache::Slot slot = { allocation, allocation->m_mapPtr };
 
     { std::unique_lock freeLock(m_freeMutex);
       auto& list = m_freeLists[poolIndex];
 
-      allocation->m_nextCached = list.head;
-      list.head = allocation;
+      list.slots[list.size] = slot;
 
       if (++list.size < list.capacity)
-        return nullptr;
+        return 0u;
 
       // Free list is full, try to add it to the list array
       // so that subsequent allocations can use it.
-      list.head = nullptr;
+      batchSize = list.size;
+
+      for (uint32_t i = 0; i < batchSize; i++)
+        batch[i] = list.slots[i];
+
       list.size = 0u;
     }
 
-    // Add free list to the pool if possible.
+    // Add the batch to the pool if possible.
     { std::unique_lock poolLock(m_poolMutex);
       auto& pool = m_pools[poolIndex];
 
@@ -579,32 +647,48 @@ namespace dxvk {
         }
 
         // If the current pool is already (one of) the largest, give up
-        // and free the entire list to avoid pools playing ping-pong.
-        if (m_pools[largestPoolIndex].listCount == pool.listCount)
-          return allocation;
+        // and free the entire batch to avoid pools playing ping-pong.
+        if (m_pools[largestPoolIndex].listCount == pool.listCount) {
+          for (uint32_t i = 0; i < batchSize; i++)
+            overflow[i] = batch[i].allocation;
+          return batchSize;
+        }
 
-        // Move first list of largest pool to current pool and free any
-        // allocations associated with it.
+        // Move first list of largest pool to current pool and return any
+        // allocations associated with it for the caller to free.
         auto& largestPool = m_pools[largestPoolIndex];
         int32_t listIndex = largestPool.listIndex;
 
-        DxvkResourceAllocation* result = m_lists[listIndex].head;
-        largestPool.listIndex = m_lists[listIndex].next;
+        auto& list = m_lists[listIndex];
+        uint32_t evicted = list.count;
+
+        for (uint32_t i = 0; i < evicted; i++)
+          overflow[i] = list.slots[i].allocation;
+
+        largestPool.listIndex = list.next;
         largestPool.listCount -= 1u;
 
-        m_lists[listIndex].head = allocation;
-        m_lists[listIndex].next = pool.listIndex;
+        list.count = uint16_t(batchSize);
+        for (uint32_t i = 0; i < batchSize; i++)
+          list.slots[i] = batch[i];
+
+        list.next = pool.listIndex;
 
         pool.listIndex = listIndex;
         pool.listCount += 1u;
-        return result;
+        return evicted;
       } else {
-        // Otherwise, allocate a fresh list and assign it to the pool
+        // Otherwise, allocate a fresh list slot and assign it to the pool
         int32_t listIndex = m_nextList;
         m_nextList = m_lists[listIndex].next;
 
-        m_lists[listIndex].head = allocation;
-        m_lists[listIndex].next = pool.listIndex;
+        auto& list = m_lists[listIndex];
+        list.count = uint16_t(batchSize);
+
+        for (uint32_t i = 0; i < batchSize; i++)
+          list.slots[i] = batch[i];
+
+        list.next = pool.listIndex;
 
         pool.listIndex = listIndex;
         pool.listCount += 1u;
@@ -612,7 +696,7 @@ namespace dxvk {
         if ((m_cacheSize += PoolCapacityInBytes) > m_maxCacheSize)
           m_maxCacheSize = m_cacheSize;
 
-        return nullptr;
+        return 0u;
       }
     }
   }
@@ -644,14 +728,15 @@ namespace dxvk {
         continue;
 
       if (time - pool.drainTime >= std::chrono::seconds(1u)) {
-        m_allocator->freeCachedAllocationsLocked(m_lists[listIndex].head);
+        auto& list = m_lists[listIndex];
+        m_allocator->freeCachedAllocationsLocked(list.slots.data(), list.count);
 
-        pool.listIndex = m_lists[listIndex].next;
+        pool.listIndex = list.next;
         pool.listCount -= 1u;
         pool.drainTime = time;
 
-        m_lists[listIndex].head = nullptr;
-        m_lists[listIndex].next = m_nextList;
+        list.count = 0u;
+        list.next = m_nextList;
 
         m_nextList = listIndex;
 
@@ -960,16 +1045,18 @@ namespace dxvk {
         if (allocationCache && createInfo.size <= DxvkLocalAllocationCache::MaxSize
          && allocationCache->m_memoryTypes && !(allocationCache->m_memoryTypes & ~memoryRequirements.memoryTypeBits)
          && (allocationInfo.properties & VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT)) {
-          allocation = allocationCache->allocateFromCache(createInfo.size);
-
-          if (likely(allocation))
-            return allocation;
+          // Cached allocations carry a pre-set reference count of 1 (set on
+          // the freeing thread) — adopt without touching the refcount.
+          if (DxvkResourceAllocation* cached = allocationCache->allocateFromCache(createInfo.size))
+            return Rc<DxvkResourceAllocation>::unsafeCreate(cached);
 
           // If the cache is currently empty for the required allocation size,
           // make sure it's not. This will also initialize the shared caches
           // for any relevant memory pools as necessary.
-          if (refillAllocationCache(allocationCache, memoryRequirements, allocationInfo.properties))
-            return allocationCache->allocateFromCache(createInfo.size);
+          if (refillAllocationCache(allocationCache, memoryRequirements, allocationInfo.properties)) {
+            if (DxvkResourceAllocation* cached = allocationCache->allocateFromCache(createInfo.size))
+              return Rc<DxvkResourceAllocation>::unsafeCreate(cached);
+          }
         }
 
         // If there is at least one memory type that supports the required
@@ -1639,12 +1726,23 @@ namespace dxvk {
       // Return cacheable allocations to the shared cache
       allocation->destroyBufferViews();
 
-      if (allocation->m_type->sharedCache)
-        allocation = allocation->m_type->sharedCache->freeAllocation(allocation);
+      // Pre-set the reference count for the NEXT owner while the object's
+      // line is still warm on this (freeing) thread. Consumers popping from
+      // the caches adopt via Rc::unsafeCreate, so the hot render-thread
+      // discard path performs NO atomic RMW and NO store to the cold object.
+      allocation->m_useCount.store(1u, std::memory_order_relaxed);
 
-      // If we get a list of allocations back from the
-      // shared cache, free all of them in one go
-      freeCachedAllocations(allocation);
+      if (allocation->m_type->sharedCache) {
+        std::array<DxvkResourceAllocation*, DxvkLocalAllocationCache::BatchCapacity> overflow;
+        uint32_t overflowCount = allocation->m_type->sharedCache->freeAllocation(allocation, overflow.data());
+
+        // If we get a batch of allocations back from the
+        // shared cache, free all of them in one go
+        if (unlikely(overflowCount))
+          freeCachedAllocations(overflow.data(), overflowCount);
+      } else {
+        freeCachedAllocations(&allocation, 1u);
+      }
     } else {
       std::unique_lock lock(m_mutex);
 
@@ -1683,23 +1781,40 @@ namespace dxvk {
           DxvkLocalAllocationCache* cache) {
     std::unique_lock lock(m_mutex);
 
-    for (size_t i = 0; i < cache->m_pools.size(); i++)
-      freeCachedAllocationsLocked(std::exchange(cache->m_pools[i], nullptr));
+    for (size_t i = 0; i < cache->m_pools.size(); i++) {
+      auto& pool = cache->m_pools[i];
+      freeCachedAllocationsLocked(pool.slots.data(), pool.count);
+      pool.count = 0u;
+    }
   }
 
 
   void DxvkMemoryAllocator::freeCachedAllocations(
-          DxvkResourceAllocation* allocation) {
-    if (allocation) {
+          DxvkResourceAllocation* const* allocations,
+          uint32_t              count) {
+    if (count) {
       std::unique_lock lock(m_mutex);
-      freeCachedAllocationsLocked(allocation);
+      freeCachedAllocationsLocked(allocations, count);
+    }
+  }
+
+
+  void DxvkMemoryAllocator::freeCachedAllocations(
+    const DxvkLocalAllocationCache::Slot* slots,
+          uint32_t              count) {
+    if (count) {
+      std::unique_lock lock(m_mutex);
+      freeCachedAllocationsLocked(slots, count);
     }
   }
 
 
   void DxvkMemoryAllocator::freeCachedAllocationsLocked(
-          DxvkResourceAllocation* allocation) {
-    while (allocation) {
+          DxvkResourceAllocation* const* allocations,
+          uint32_t              count) {
+    for (uint32_t i = 0; i < count; i++) {
+      DxvkResourceAllocation* allocation = allocations[i];
+
       auto& pool = allocation->m_mapPtr
         ? allocation->m_type->mappedPool
         : allocation->m_type->devicePool;
@@ -1713,7 +1828,17 @@ namespace dxvk {
           updateMemoryHeapStats(allocation->m_type->properties.heapIndex);
       }
 
-      m_allocationPool.free(std::exchange(allocation, allocation->m_nextCached));
+      m_allocationPool.free(allocation);
+    }
+  }
+
+
+  void DxvkMemoryAllocator::freeCachedAllocationsLocked(
+    const DxvkLocalAllocationCache::Slot* slots,
+          uint32_t              count) {
+    for (uint32_t i = 0; i < count; i++) {
+      DxvkResourceAllocation* allocation = slots[i].allocation;
+      freeCachedAllocationsLocked(&allocation, 1u);
     }
   }
 
@@ -1881,25 +2006,26 @@ namespace dxvk {
           memoryType.sharedCache = new DxvkSharedAllocationCache(this);
       }
 
-      // Try to grab a list of allocations from the shared cache first. If
+      // Try to grab a batch of allocations from the shared cache first. If
       // this succeeds, allocating several pages of memory is near instant.
-      DxvkResourceAllocation* allocation = memoryType.sharedCache->getAllocationList(allocationSize);
+      std::array<DxvkLocalAllocationCache::Slot, DxvkLocalAllocationCache::BatchCapacity> batch;
+      uint32_t batchSize = memoryType.sharedCache->getAllocationBatch(allocationSize, batch.data());
 
-      if (likely(allocation)) {
-        allocation = cache->assignCache(allocationSize, allocation);
-        freeCachedAllocations(allocation);
+      if (likely(batchSize)) {
+        uint32_t consumed = cache->fillCache(allocationSize, batch.data(), batchSize);
+
+        if (unlikely(consumed < batchSize))
+          freeCachedAllocations(batch.data() + consumed, batchSize - consumed);
+
         return true;
       }
 
       // Fill cache with the preferred allocation count of this size category so
       // that subsequent allocations can be handled without locking the allocator.
-      DxvkResourceAllocation* head = nullptr;
-      DxvkResourceAllocation* tail = nullptr;
-
       std::unique_lock lock(m_mutex);
       auto& memoryPool = memoryType.mappedPool;
 
-      while (allocationCount) {
+      while (allocationCount && batchSize < uint32_t(batch.size())) {
         // Try to suballocate from existing chunks, but do not create
         // any new chunks. Let the regular code path handle that case
         // as necessary.
@@ -1908,25 +2034,24 @@ namespace dxvk {
         if (address < 0)
           break;
 
-        // Add allocation to the list and mark it as cacheable,
-        // so it will get recycled as-is after use.
-        allocation = createAllocation(memoryType, memoryPool,
+        // Add allocation to the batch and mark it as cacheable,
+        // so it will get recycled as-is after use. Cached allocations carry
+        // a pre-set reference count of 1 for adoption via Rc::unsafeCreate.
+        DxvkResourceAllocation* allocation = createAllocation(memoryType, memoryPool,
           address, allocationSize, DxvkAllocationInfo());
         allocation->m_flags.set(DxvkAllocationFlag::CanCache);
+        allocation->m_useCount.store(1u, std::memory_order_relaxed);
 
-        if (tail) {
-          tail->m_nextCached = allocation;
-          tail = allocation;
-        } else {
-          head = allocation;
-          tail = allocation;
-        }
-
+        batch[batchSize++] = { allocation, allocation->m_mapPtr };
         allocationCount--;
       }
 
-      if (tail) {
-        tail->m_nextCached = cache->assignCache(allocationSize, head);
+      if (batchSize) {
+        uint32_t consumed = cache->fillCache(allocationSize, batch.data(), batchSize);
+
+        if (unlikely(consumed < batchSize))
+          freeCachedAllocationsLocked(batch.data() + consumed, batchSize - consumed);
+
         return true;
       }
     }

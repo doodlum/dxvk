@@ -71,7 +71,51 @@ namespace dxvk {
 
   template<typename ContextType>
   D3D11CommonContext<ContextType>::~D3D11CommonContext() {
+    // Drop any keep-alive references that were never handed to the CS stream.
+    // This base dtor runs after the immediate context's dtor body (which has
+    // already flushed and synchronized the CS thread), so no closure can still
+    // be using these wrappers.
+    for (auto* buffer : m_csKeepAlive)
+      buffer->ReleasePrivate();
+    m_csKeepAlive.clear();
+  }
 
+
+  template<typename ContextType>
+  void D3D11CommonContext<ContextType>::KeepBufferAlive(D3D11Buffer* pBuffer) {
+    if (pBuffer->GetCsRefSeq() != m_csKeepAliveSeq) {
+      // Backstop for pathological flush-free stretches. Must run BEFORE the
+      // current buffer is stamped/added: the release closure only covers
+      // captures already recorded into the stream, and this buffer's capture
+      // is only emitted by the caller after we return.
+      if (unlikely(m_csKeepAlive.size() >= 4096u))
+        FlushKeepAlive();
+
+      pBuffer->SetCsRefSeq(m_csKeepAliveSeq);
+      pBuffer->AddRefPrivate();
+      m_csKeepAlive.push_back(pBuffer);
+    }
+  }
+
+
+  template<typename ContextType>
+  void D3D11CommonContext<ContextType>::FlushKeepAlive() {
+    if (m_csKeepAlive.empty())
+      return;
+
+    // Bump the generation FIRST so captures recorded after this point re-add
+    // their buffer, and move the list out before EmitCs so a chunk-overflow
+    // re-entry sees an empty list.
+    m_csKeepAliveSeq += 1u;
+
+    EmitCs([
+      cList = std::move(m_csKeepAlive)
+    ] (DxvkContext*) {
+      for (auto* buffer : cList)
+        buffer->ReleasePrivate();
+    });
+
+    m_csKeepAlive.clear();
   }
 
 
@@ -3743,6 +3787,9 @@ namespace dxvk {
         // resolved at draw-record time) so this is behavior-identical. Safe for a
         // Skyrim-only fork: the app keeps the buffer alive across the sub-frame render->CS
         // handoff (same assumption as the non-owning immediate-context state bindings).
+        // NOTE: deliberately NOT keep-alive tracked — Skyrim binds thousands of DISTINCT
+        // VBs/IBs once each per frame, so the dedup stamp never pays for itself here
+        // (measured as a regression); the bare raw capture is the proven-stable shape.
         // Deferred command lists can be replayed after the buffer changes/dies, so they
         // must keep the ref-holding slice (below).
         EmitCs([
@@ -3811,7 +3858,8 @@ namespace dxvk {
     if (pBuffer) {
       if constexpr (!IsDeferred) {
         // Immediate context: build the slice on the CS thread; render thread only
-        // captures a raw pointer. See BindVertexBuffer for rationale and safety.
+        // captures a raw pointer. See BindVertexBuffer for rationale and safety
+        // (including why this is NOT keep-alive tracked).
         EmitCs([
           cBuffer       = pBuffer,
           cOffset       = Offset,
@@ -3913,14 +3961,35 @@ namespace dxvk {
     uint32_t slotId = D3D11ShaderResourceMapping::computeCbvBinding(ShaderStage, Slot);
 
     if (pBuffer) {
-      EmitCs([
-        cSlotId      = slotId,
-        cStage       = GetShaderStage(ShaderStage),
-        cBufferSlice = pBuffer->GetBufferSlice(16 * Offset, 16 * Length)
-      ] (DxvkContext* ctx) mutable {
-        ctx->bindUniformBuffer(cStage, cSlotId,
-          Forwarder::move(cBufferSlice));
-      });
+      if constexpr (!IsDeferred) {
+        // Immediate context: constant-buffer binds are THE hottest call in
+        // Skyrim's draw loop. Capture the raw wrapper (no refcount atomic on
+        // the busy render thread) and build the DxvkBufferSlice on the CS
+        // thread. Unlike the VB/IB variant of this pattern, the wrapper's
+        // lifetime across the handoff is guaranteed by the per-chunk
+        // keep-alive reference, so this is safe even during load-time churn.
+        KeepBufferAlive(pBuffer);
+
+        EmitCs([
+          cSlotId = slotId,
+          cStage  = GetShaderStage(ShaderStage),
+          cBuffer = pBuffer,
+          cOffset = VkDeviceSize(16u) * Offset,
+          cLength = VkDeviceSize(16u) * Length
+        ] (DxvkContext* ctx) {
+          ctx->bindUniformBuffer(cStage, cSlotId,
+            cBuffer->GetBufferSlice(cOffset, cLength));
+        });
+      } else {
+        EmitCs([
+          cSlotId      = slotId,
+          cStage       = GetShaderStage(ShaderStage),
+          cBufferSlice = pBuffer->GetBufferSlice(16 * Offset, 16 * Length)
+        ] (DxvkContext* ctx) mutable {
+          ctx->bindUniformBuffer(cStage, cSlotId,
+            Forwarder::move(cBufferSlice));
+        });
+      }
     } else {
       EmitCs([
         cSlotId      = slotId,

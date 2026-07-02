@@ -347,15 +347,23 @@ namespace dxvk {
       // it as the 'new' mapped slice. This assumes that the
       // only way to invalidate a buffer is by mapping it.
       auto bufferSlice = pResource->DiscardSlice(&m_allocationCache);
-      pMappedResource->pData      = bufferSlice->mapPtr();
+      // GetMapPtr() reads the wrapper's warm cached pointer (set by
+      // DiscardSlice) instead of loading from the cold allocation object.
+      pMappedResource->pData      = pResource->GetMapPtr();
       pMappedResource->RowPitch   = bufferSize;
       pMappedResource->DepthPitch = bufferSize;
-      
+
+      // Capture the raw wrapper (keep-alive ref guarantees its lifetime) and
+      // resolve the Rc<DxvkBuffer> on the CS thread instead of paying the
+      // heavily contended refcount atomic here — this Map(DISCARD) runs once
+      // per dynamic-CB write, i.e. thousands of times per frame in Skyrim.
+      KeepBufferAlive(pResource);
+
       EmitCs([
-        cBuffer      = pResource->GetBuffer(),
+        cBuffer      = pResource,
         cBufferSlice = std::move(bufferSlice)
       ] (DxvkContext* ctx) mutable {
-        ctx->invalidateBuffer(cBuffer, std::move(cBufferSlice));
+        ctx->invalidateBuffer(cBuffer->GetBufferRef(), std::move(cBufferSlice));
       });
 
       // Ignore small buffers here. These are often updated per
@@ -747,13 +755,17 @@ namespace dxvk {
 
     if (likely(CopyFlags != D3D11_COPY_NO_OVERWRITE)) {
       auto bufferSlice = pDstBuffer->DiscardSlice(&m_allocationCache);
-      mapPtr = bufferSlice->mapPtr();
+      mapPtr = pDstBuffer->GetMapPtr();
+
+      // Same raw-wrapper capture as the Map(WRITE_DISCARD) fast path; the
+      // keep-alive reference covers the render->CS handoff.
+      KeepBufferAlive(pDstBuffer);
 
       EmitCs([
-        cBuffer      = pDstBuffer->GetBuffer(),
+        cBuffer      = pDstBuffer,
         cBufferSlice = std::move(bufferSlice)
       ] (DxvkContext* ctx) mutable {
-        ctx->invalidateBuffer(cBuffer, std::move(cBufferSlice));
+        ctx->invalidateBuffer(cBuffer->GetBufferRef(), std::move(cBufferSlice));
       });
     } else {
       mapPtr = pDstBuffer->GetMapPtr();
