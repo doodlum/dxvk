@@ -62,6 +62,11 @@ namespace dxvk {
   D3D11Device::~D3D11Device() {
     delete m_d3d10Device;
     m_context = nullptr;
+    // The immediate context is gone (its dtor flushed + synchronized the CS
+    // thread), so no raw references remain and no more retirements can arrive.
+    // Delete everything still parked in the deferred-destruction ring now,
+    // before m_dxvkDevice is torn down.
+    DrainRetiredResources();
     delete m_initializer;
   }
   

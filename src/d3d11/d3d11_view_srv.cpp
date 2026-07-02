@@ -191,7 +191,13 @@ namespace dxvk {
     m_imageView = nullptr;
     m_bufferView = nullptr;
   }
-  
+
+
+  void D3D11ShaderResourceView::deleteThis() {
+    // Defer destruction — see D3D11Buffer::deleteThis / D3D11Device::RetireResource.
+    m_parent->RetireResource([this] { delete this; });
+  }
+
   
   HRESULT STDMETHODCALLTYPE D3D11ShaderResourceView::QueryInterface(REFIID riid, void** ppvObject) {
     if (ppvObject == nullptr)

@@ -213,8 +213,15 @@ namespace dxvk {
       const D3D11_RESOURCE_FLAGS*   pResourceFlags,
             D3D11_BUFFER_DESC*      pBufferDesc);
 
+  protected:
+
+    // Buffers are bound non-owningly (CBV/VBV/IBV) and captured by raw pointer
+    // into async CS closures, so defer destruction until the CS thread drains
+    // past any such reference. See D3D11Device::RetireResource.
+    void deleteThis() override;
+
   private:
-    
+
     D3D11_BUFFER_DESC             m_desc;
     D3D11_ON_12_RESOURCE_INFO     m_11on12;
     D3D11_COMMON_BUFFER_MAP_MODE  m_mapMode;
