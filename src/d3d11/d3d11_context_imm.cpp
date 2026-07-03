@@ -356,7 +356,7 @@ namespace dxvk {
       // Capture the raw wrapper (keep-alive ref guarantees its lifetime) and
       // resolve the Rc<DxvkBuffer> on the CS thread instead of paying the
       // heavily contended refcount atomic here — this Map(DISCARD) runs once
-      // per dynamic-CB write, i.e. thousands of times per frame in Skyrim.
+      // per dynamic-CB write, i.e. thousands of times per frame.
       KeepBufferAlive(pResource);
 
       EmitCs([

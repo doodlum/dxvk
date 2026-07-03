@@ -747,7 +747,7 @@ namespace dxvk {
     // Fake-fullscreen (default in this build): skip the real display mode change so the desktop keeps
     // its native resolution and refresh rate. The window is then stretched to cover the monitor
     // (modeSwitch forced off below) and the swapchain scales onto it. A real exclusive-fullscreen
-    // transition breaks Streamline frame generation and causes an alt-tab freeze, so "fullscreen"
+    // transition breaks external frame generation and causes an alt-tab freeze, so "fullscreen"
     // stays borderless.
     const bool fakeFullscreen = m_factory->GetOptions()->fakeFullscreen;
 

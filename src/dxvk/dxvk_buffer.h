@@ -472,9 +472,9 @@ namespace dxvk {
 
     // Cached storage-allocation descriptors. These are immutable for the buffer's
     // lifetime (derived from m_info / m_properties / m_sharingMode / cookie()), so we
-    // build them once and reuse them on every DISCARD. Skyrim maps dynamic constant
-    // buffers with WRITE_DISCARD on nearly every draw; rebuilding these two structs per
-    // call was measurable render-thread cost in the allocation subtree.
+    // build them once and reuse them on every DISCARD. Apps that map dynamic constant
+    // buffers with WRITE_DISCARD repeatedly (on nearly every draw) would otherwise rebuild
+    // these two structs per call — measurable render-thread cost in the allocation subtree.
     VkBufferCreateInfo          m_storageBufferInfo = { VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO };
     DxvkAllocationInfo          m_storageAllocInfo  = { };
     uint32_t                    m_storageMemTypeBits = 0u;

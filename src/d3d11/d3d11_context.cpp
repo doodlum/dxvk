@@ -3785,8 +3785,8 @@ namespace dxvk {
         // thread) and build the logical DxvkBufferSlice on the CS thread instead. This is
         // behavior-identical, and safe because the app keeps the buffer alive across the
         // sub-frame render->CS handoff (same assumption as the non-owning state bindings).
-        // Not keep-alive tracked: Skyrim binds thousands of distinct VBs/IBs once each per
-        // frame, so the dedup stamp does not pay for itself. Deferred lists can replay after
+        // Not keep-alive tracked: for apps that bind thousands of distinct VBs/IBs once each per
+        // frame, the dedup stamp does not pay for itself. Deferred lists can replay after
         // the buffer dies, so they keep the ref-holding slice (below).
         EmitCs([
           cSlotId       = Slot,

@@ -146,12 +146,12 @@ namespace dxvk {
       const Rc<DxvkLatencyTracker>& tracker);
 
     /**
-     * \brief Marks this swapchain as owned by an external frame-generation layer (FFX FSR3)
+     * \brief Marks this swapchain as owned by an external frame-generation layer (FFX frame interpolation)
      *
      * When set, the Presenter acts as a thin submit + hand-off: it does NOT run its own
      * present-wait worker, does NOT acquire the next image after presenting, and signals the
      * frame-latency event immediately on the submit thread. This leaves the external frame-gen
-     * swapchain (FFX) as the single owner of the present loop — matching the official FSR3
+     * swapchain (FFX) as the single owner of the present loop — matching the FFX
      * frame-interpolation-swapchain model and avoiding a stacked-present-loop deadlock. Set
      * automatically at swapchain creation via the dxvkSetFrameGenOwnershipQuery predicate.
      */

@@ -61,7 +61,7 @@ namespace dxvk {
 
     /// Fake exclusive fullscreen as borderless: on a fullscreen transition, do not change the real
     /// display mode — keep the desktop resolution/refresh and cover the monitor with the window,
-    /// letting the swapchain scale. Avoids the exclusive-fullscreen transition that breaks Streamline
+    /// letting the swapchain scale. Avoids the exclusive-fullscreen transition that breaks external
     /// frame generation and freezes on alt-tab. Hardcoded on in this build.
     bool fakeFullscreen;
   };
