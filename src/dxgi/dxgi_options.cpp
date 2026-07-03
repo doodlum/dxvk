@@ -146,14 +146,16 @@ namespace dxvk {
     this->syncInterval     = config.getOption<int32_t>("dxgi.syncInterval", -1);
     this->forceRefreshRate = config.getOption<int32_t>("dxgi.forceRefreshRate", 0u);
 
-    // Real exclusive-fullscreen mode change at the game resolution, forced to the native refresh rate, so
-    // the swapchain is the game resolution (display engine stretches to the panel) while Streamline frame
-    // generation keeps its refresh headroom. The default fullscreen path in this Community Shaders build.
-    this->fullscreenNativeRefresh = config.getOption<bool>("dxgi.fullscreenNativeRefresh", true);
-
-    // Off-by-default escape hatch: fake exclusive fullscreen as borderless (no real display mode change).
-    // fullscreenNativeRefresh takes precedence over this when both are set.
-    this->fakeFullscreen   = config.getOption<bool>("dxgi.fakeFullscreen", false);
+    // Exclusive fullscreen (FSE) is COMPLETELY disabled in this Community Shaders build, unconditionally.
+    // A real exclusive mode-set makes Windows revoke exclusivity on minimize/alt-tab, which forces DXVK to
+    // RECREATE the swapchain — and that tears down the FFX frame-generation swapchain (ffxDestroyContext),
+    // which DEADLOCKS: FFX forbids recreating its FrameInterpolation swapchain in fullscreen (its samples use
+    // a passthrough/occlusion mode and never recreate on minimize). Root cause of the alt-tab/minimize freeze.
+    // Force borderless everywhere instead: the desktop keeps its native resolution AND refresh rate (so
+    // Streamline DLSS-G keeps its refresh headroom) and the window is stretched to cover the monitor. The
+    // dxgi.fullscreenNativeRefresh / dxgi.fakeFullscreen options are intentionally NOT honored here.
+    this->fullscreenNativeRefresh = false;  // never do a real exclusive display mode-set
+    this->fakeFullscreen          = true;   // always borderless (fakeFullscreen path in EnterFullscreenMode/ResizeTarget)
 
     // We don't support dcomp swapchains and some games may rely on them failing on creation
     this->enableDummyCompositionSwapchain = config.getOption<bool>("dxgi.enableDummyCompositionSwapchain", false);
