@@ -357,19 +357,6 @@ namespace dxvk {
   }
 
 
-  void STDMETHODCALLTYPE D3D11SwapChain::SetFullscreenExclusive(
-          BOOL                      /*Fullscreen*/) {
-    // Exclusive fullscreen (FSE) is COMPLETELY disabled in this Community Shaders build (see the DXGI-level
-    // disable in dxgi_options.cpp). Never acquire VK_EXT_full_screen_exclusive: a real alt-tab revokes it,
-    // which surfaces as vkQueueSubmit VK_ERROR_DEVICE_LOST (-4) and freezes the game while FSR-FG is active.
-    // Force DISALLOWED regardless of the DXGI fullscreen state so alt-tab merely defocuses a borderless window.
-    m_fullscreenExclusive = FALSE;
-
-    if (m_presenter != nullptr)
-      m_presenter->setFullScreenExclusiveMode(VK_FULL_SCREEN_EXCLUSIVE_DISALLOWED_EXT);
-  }
-
-
   Rc<DxvkImageView> D3D11SwapChain::GetBackBufferView() {
     Rc<DxvkImage> image = GetCommonTexture(m_backBuffers[0].ptr())->GetImage();
 
@@ -531,8 +518,6 @@ namespace dxvk {
     m_presenter->setSurfaceFormat(GetSurfaceFormat(m_desc.Format));
     m_presenter->setSurfaceExtent({ m_desc.Width, m_desc.Height });
     m_presenter->setFrameRateLimit(m_targetFrameRate, GetActualFrameLatency());
-    // FSE completely disabled in this build — never acquire VK exclusive (see SetFullscreenExclusive above).
-    m_presenter->setFullScreenExclusiveMode(VK_FULL_SCREEN_EXCLUSIVE_DISALLOWED_EXT);
 
     m_latency = m_device->createLatencyTracker(m_presenter);
 

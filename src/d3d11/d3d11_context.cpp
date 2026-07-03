@@ -3781,17 +3781,13 @@ namespace dxvk {
           UINT                              Stride) {
     if (pBuffer) {
       if constexpr (!IsDeferred) {
-        // Immediate context only: capture the raw D3D11Buffer* (no atomic on the busy
-        // render thread) and build the DxvkBufferSlice (Rc<DxvkBuffer> refcount) on the
-        // ~idle CS thread instead. The slice is logical (buffer + range; physical storage
-        // resolved at draw-record time) so this is behavior-identical. Safe for a
-        // Skyrim-only fork: the app keeps the buffer alive across the sub-frame render->CS
-        // handoff (same assumption as the non-owning immediate-context state bindings).
-        // NOTE: deliberately NOT keep-alive tracked — Skyrim binds thousands of DISTINCT
-        // VBs/IBs once each per frame, so the dedup stamp never pays for itself here
-        // (measured as a regression); the bare raw capture is the proven-stable shape.
-        // Deferred command lists can be replayed after the buffer changes/dies, so they
-        // must keep the ref-holding slice (below).
+        // Immediate context: capture the raw D3D11Buffer* (no refcount atomic on the render
+        // thread) and build the logical DxvkBufferSlice on the CS thread instead. This is
+        // behavior-identical, and safe because the app keeps the buffer alive across the
+        // sub-frame render->CS handoff (same assumption as the non-owning state bindings).
+        // Not keep-alive tracked: Skyrim binds thousands of distinct VBs/IBs once each per
+        // frame, so the dedup stamp does not pay for itself. Deferred lists can replay after
+        // the buffer dies, so they keep the ref-holding slice (below).
         EmitCs([
           cSlotId       = Slot,
           cBuffer       = pBuffer,
@@ -3962,12 +3958,10 @@ namespace dxvk {
 
     if (pBuffer) {
       if constexpr (!IsDeferred) {
-        // Immediate context: constant-buffer binds are THE hottest call in
-        // Skyrim's draw loop. Capture the raw wrapper (no refcount atomic on
-        // the busy render thread) and build the DxvkBufferSlice on the CS
-        // thread. Unlike the VB/IB variant of this pattern, the wrapper's
-        // lifetime across the handoff is guaranteed by the per-chunk
-        // keep-alive reference, so this is safe even during load-time churn.
+        // Immediate context: capture the raw wrapper and build the slice on the CS thread
+        // (see BindVertexBuffer). Unlike VB/IB, constant buffers are rebound thousands of
+        // times per frame, so the per-chunk keep-alive reference both pays for itself and
+        // guarantees the wrapper's lifetime across the handoff during load-time churn.
         KeepBufferAlive(pBuffer);
 
         EmitCs([
@@ -4057,11 +4051,9 @@ namespace dxvk {
     if (pResource) {
       if (pResource->GetViewInfo().Dimension != D3D11_RESOURCE_DIMENSION_BUFFER) {
         if constexpr (!IsDeferred) {
-          // Immediate context: capture the raw view (no Rc atomic on the busy render
-          // thread) and take the DxvkImageView ref inside the CS-thread closure. Exteriors
-          // bind a huge number of SRVs per frame, so moving this per-bind atomic to the
-          // idle CS thread is a real render-thread saving. SRVs (textures) outlive the
-          // sub-frame handoff (unlike dynamic CBs), so the raw capture is safe here.
+          // Immediate context: capture the raw view and take the DxvkImageView ref on the
+          // CS thread (see BindVertexBuffer). SRVs (textures) outlive the sub-frame handoff,
+          // so the raw capture is safe here without keep-alive tracking.
           EmitCs([
             cSlotId = slotId,
             cStage  = GetShaderStage(ShaderStage),

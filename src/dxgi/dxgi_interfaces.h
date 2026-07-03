@@ -141,9 +141,6 @@ MIDL_INTERFACE("aed91093-e02e-458c-bdef-a97da1a7e6d2")
 IDXGIVkSwapChain2 : public IDXGIVkSwapChain1 {
   virtual void STDMETHODCALLTYPE SetTargetFrameRate(
           double                    FrameRate) = 0;
-
-  virtual void STDMETHODCALLTYPE SetFullscreenExclusive(
-          BOOL                      Fullscreen) = 0;
 };
 
 

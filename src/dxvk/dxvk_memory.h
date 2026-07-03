@@ -779,27 +779,20 @@ namespace dxvk {
 
     constexpr static VkDeviceSize PoolCapacityInBytes = 4u * DxvkPageAllocator::PageSize;
 
-    // Allocations per batch. The caching protocol hands allocations around in
-    // dense slot-array batches instead of intrusive linked lists: list pops
-    // made the per-draw dynamic-buffer discard path take one serial cold-
-    // cache-line miss per allocation (the next-pointer lives inside the cold
-    // object), which profiled as the single largest render-thread cost in
-    // draw-heavy scenes. With slot arrays, pops touch a single dense line and
-    // the cold object lines can be prefetched ahead by index.
-    //
-    // Deliberately a small fixed cap (NOT PoolCapacityInBytes / MinSize =
-    // 1024): the arrays must stay cache-resident — a first cut sized them for
-    // the worst case and the resulting 16 KiB-per-pool layout made the pop
-    // itself the memory stall it was meant to remove.
+    // Allocations per batch. The caching protocol hands allocations around in dense slot
+    // arrays rather than intrusive linked lists: a list pop dereferences the next-pointer
+    // inside the cold object, one serial cache-line miss per allocation on the per-draw
+    // discard path. Slot-array pops touch a single dense line and prefetch cold objects by
+    // index. A small fixed cap (not PoolCapacityInBytes / MinSize = 1024) keeps the arrays
+    // cache-resident.
     constexpr static uint32_t BatchCapacity = 64u;
 
     /**
      * \brief Cached allocation slot
      *
-     * The mapped pointer rides along with the allocation pointer (captured
-     * while the object line was warm on the freeing thread) so pops can
-     * prefetch an upcoming allocation's mapped memory ahead of the caller's
-     * write through Map(). Interleaved so one pop touches one cache line.
+     * The mapped pointer is captured alongside the allocation while the object line was
+     * warm on the freeing thread, so the hot discard path can hand it to the caller
+     * without loading the cold allocation object.
      */
     struct Slot {
       DxvkResourceAllocation* allocation;

@@ -452,16 +452,11 @@ namespace dxvk {
 
     Slot slot = pool.slots[--pool.count];
 
-    // Prefetch the allocation OBJECT a few pops ahead: the objects were last
-    // touched by the CS/submit thread when freed, so their first touch is a
-    // cross-core transfer; the pool arena is dense (few pages) so this stays
-    // TLB-friendly. Measured +4 FPS vs no prefetch.
-    //
-    // ⚠️ Never prefetch slot.mapPtr here — measured to HURT (~3s of render-
-    // thread time per 16s): the mapped targets are scattered across thousands
-    // of distinct 4 KiB pages, so nearly every such prefetch missed the DTLB
-    // and triggered a page walk ON THE POP, far exceeding the miss it was
-    // meant to hide.
+    // Prefetch the allocation object a few pops ahead: objects were last touched
+    // by the CS/submit thread when freed, so their first touch is a cross-core
+    // transfer; the pool arena is dense so this stays TLB-friendly. Never prefetch
+    // slot.mapPtr here: the mapped targets are scattered across thousands of
+    // distinct pages, so the prefetch triggers a page walk on the pop instead.
     if (pool.count >= 4u)
       _mm_prefetch(reinterpret_cast<const char*>(pool.slots[pool.count - 4u].allocation), _MM_HINT_T0);
 
@@ -481,10 +476,9 @@ namespace dxvk {
     for (uint32_t i = 0; i < consumed; i++)
       pool.slots[pool.count + i] = slots[i];
 
-    // NOTE: do NOT sort the batch by mapped address — tried and measured a
-    // ~3% regression. The shared cache's LIFO order carries temporal
-    // recency (recently freed slices have warm lines and hot TLB entries),
-    // which beats the spatial-locality ordering it was traded for.
+    // Do not sort the batch by mapped address: the shared cache's LIFO order
+    // carries temporal recency (recently freed slices have warm lines and hot
+    // TLB entries), which beats spatial-locality ordering here.
     pool.count += uint16_t(consumed);
 
     // Warm the tail of the pool (the next few pops) right away — the pop-time

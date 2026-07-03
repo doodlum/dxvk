@@ -146,16 +146,11 @@ namespace dxvk {
     this->syncInterval     = config.getOption<int32_t>("dxgi.syncInterval", -1);
     this->forceRefreshRate = config.getOption<int32_t>("dxgi.forceRefreshRate", 0u);
 
-    // Exclusive fullscreen (FSE) is COMPLETELY disabled in this Community Shaders build, unconditionally.
-    // A real exclusive mode-set makes Windows revoke exclusivity on minimize/alt-tab, which forces DXVK to
-    // RECREATE the swapchain — and that tears down the FFX frame-generation swapchain (ffxDestroyContext),
-    // which DEADLOCKS: FFX forbids recreating its FrameInterpolation swapchain in fullscreen (its samples use
-    // a passthrough/occlusion mode and never recreate on minimize). Root cause of the alt-tab/minimize freeze.
-    // Force borderless everywhere instead: the desktop keeps its native resolution AND refresh rate (so
-    // Streamline DLSS-G keeps its refresh headroom) and the window is stretched to cover the monitor. The
-    // dxgi.fullscreenNativeRefresh / dxgi.fakeFullscreen options are intentionally NOT honored here.
-    this->fullscreenNativeRefresh = false;  // never do a real exclusive display mode-set
-    this->fakeFullscreen          = true;   // always borderless (fakeFullscreen path in EnterFullscreenMode/ResizeTarget)
+    // Force fullscreen to a borderless window with no display mode-set. A real exclusive mode-set is
+    // revoked by Windows on minimize/alt-tab, which recreates the swapchain and tears down the FFX
+    // frame-generation swapchain, deadlocking (root cause of the alt-tab/minimize freeze). Hardcoded
+    // on in this build.
+    this->fakeFullscreen = true;
 
     // We don't support dcomp swapchains and some games may rely on them failing on creation
     this->enableDummyCompositionSwapchain = config.getOption<bool>("dxgi.enableDummyCompositionSwapchain", false);

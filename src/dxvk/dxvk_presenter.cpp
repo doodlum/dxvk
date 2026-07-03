@@ -10,51 +10,39 @@
 
 namespace dxvk {
 
-  // External FFX frame-generation ownership predicate. Community Shaders' WSI hook sets this (via the
-  // exported dxvkSetFrameGenOwnershipQuery below): given a freshly created VkSwapchainKHR it returns
-  // true when that handle is the external FFX frame-interpolation swapchain. When so, the Presenter
-  // becomes a thin submit + hand-off and lets FFX own the single present loop. Null => never owned.
+  // External FFX frame-generation ownership predicate, set by the CS WSI hook. Returns true for the
+  // external FFX frame-interpolation swapchain; when owned, the Presenter becomes a thin submit +
+  // hand-off and lets FFX own the present loop. Null => never owned.
   std::atomic<bool (*)(VkSwapchainKHR)> g_dxvkFrameGenOwnsSwapchain = { nullptr };
 
-  // Exported (see src/d3d11/d3d11.def) so the CS WSI hook can register the predicate by resolving it
-  // from the loaded DXVK d3d11 module (csd3d11.dll). extern "C" keeps the symbol name unmangled.
   extern "C" void dxvkSetFrameGenOwnershipQuery(bool (*query)(VkSwapchainKHR)) {
     g_dxvkFrameGenOwnsSwapchain.store(query, std::memory_order_release);
   }
 
-  // One-shot request to recreate the Vulkan swapchain on the next acquire. Community Shaders pokes this
-  // when switching frame-generation method from DLSS-G back to FSR: sl.dlss_g's present proxy is sticky
-  // and bypasses the Vulkan present hooks, so FSR can never return VK_SUBOPTIMAL to trigger a recreate.
-  // Forcing DXVK's own (internal) swapchain recreate here is safe — it preserves the D3D11 back buffers
-  // (DXVK blits them onto the fresh Vulkan swapchain) and re-runs vkCreate/DestroySwapchainKHR, letting
-  // dlss_g release its proxy (its destroy hook fires) and the FFX FG layer wrap the new swapchain.
+  // One-shot request to recreate the Vulkan swapchain on the next acquire. CS uses this on a DLSS-G ->
+  // FSR frame-gen switch: sl.dlss_g's sticky present proxy bypasses the Vulkan present hooks, so FSR
+  // never returns VK_SUBOPTIMAL to trigger a recreate. A DXVK-internal recreate preserves the D3D11
+  // back buffers and re-runs vkCreate/DestroySwapchainKHR, releasing the proxy.
   std::atomic<bool> g_dxvkForceSwapchainRecreate = { false };
 
-  // Exported (see src/d3d11/d3d11.def) so CS can request the recreate from csd3d11.dll. extern "C"
-  // keeps the symbol unmangled. Consumed at the next Presenter::updateSwapChain (under the surface lock).
   extern "C" void dxvkRequestSwapchainRecreate() {
     g_dxvkForceSwapchainRecreate.store(true, std::memory_order_release);
   }
 
-  // Callback invoked inside recreateSwapChain() AFTER the old swapchain is destroyed and BEFORE the new one
-  // is created — i.e. while no swapchain exists. The Streamline DLSS-G guide §18 requires slSetFeatureLoaded
-  // to be called in exactly this window (bracketed by swapchain release + recreate) so the next
-  // vkCreateSwapchainKHR installs or omits DLSS-G's present proxy. CS registers a callback that toggles
-  // DLSS-G's loaded state here. Runs under m_surfaceMutex on the present/acquire thread.
-  void (*g_dxvkSwapchainTornDownCallback)() = nullptr;
+  // Callback invoked inside recreateSwapChain() while no swapchain exists (after destroy, before create).
+  // The Streamline DLSS-G guide requires slSetFeatureLoaded in exactly this window so the next
+  // vkCreateSwapchainKHR installs or omits DLSS-G's present proxy. Runs under m_surfaceMutex.
+  std::atomic<void (*)()> g_dxvkSwapchainTornDownCallback = { nullptr };
+
   extern "C" void dxvkSetSwapchainTornDownCallback(void (*cb)()) {
-    g_dxvkSwapchainTornDownCallback = cb;
+    g_dxvkSwapchainTornDownCallback.store(cb, std::memory_order_release);
   }
 
-  // External frame-rate cap, in fps. Community Shaders drives this via the exported dxvkSetTargetFrameRate
-  // below to limit present rate when its own limiter owns pacing — specifically for FSR frame generation,
-  // which forces Reflex OFF (FFX paces itself) and therefore has no Reflex frame limiter to fall back on.
-  // NaN => not set by CS (the swapchain's own DXGI target governs). 0 => unlimited. >0 => explicit cap.
-  // Reconciled into each Presenter's m_fpsLimiter every present via applyExternalFrameRateLimit().
+  // External frame-rate cap, in fps, driven by CS to pace presents when nothing else does (FSR frame
+  // generation forces Reflex off, so it has no Reflex limiter). NaN => unset, 0 => unlimited, >0 => cap.
+  // Reconciled into m_fpsLimiter every present via applyExternalFrameRateLimit().
   std::atomic<double> g_dxvkExternalFrameRate = { std::numeric_limits<double>::quiet_NaN() };
 
-  // Exported (see src/d3d11/d3d11.def) so CS can set the cap by resolving it from csd3d11.dll. extern "C"
-  // keeps the symbol unmangled. fps <= 0 means unlimited; pass a positive value to cap.
   extern "C" void dxvkSetTargetFrameRate(double fps) {
     g_dxvkExternalFrameRate.store(fps < 0.0 ? 0.0 : fps, std::memory_order_release);
   }
@@ -75,13 +63,12 @@ namespace dxvk {
     m_vki(device->instance()->vki()),
     m_vkd(device->vkd()),
     m_surfaceProc(std::move(proc)) {
-    // Even with dxvk.allowFse enabled, swapchains START with FSE disallowed:
-    // the ALLOWED declaration disables dynamic present-mode switching (vsync
-    // toggles would recreate the swapchain) and only has meaning when the
-    // window covers a display. The DXGI layer enables it on fullscreen
-    // transitions via setFullScreenExclusiveMode. On Windows, FSE is required
-    // for VRR/HDR and for uncapped presents to bypass DWM composition.
-    m_fullscreenMode = VK_FULL_SCREEN_EXCLUSIVE_DISALLOWED_EXT;
+    // Only enable FSE if the user explicitly opts in. On Windows, FSE
+    // is required to support VRR or HDR, but blocks alt-tabbing or
+    // overlapping windows, which breaks a number of games.
+    m_fullscreenMode = m_device->config().allowFse
+      ? VK_FULL_SCREEN_EXCLUSIVE_ALLOWED_EXT
+      : VK_FULL_SCREEN_EXCLUSIVE_DISALLOWED_EXT;
 
     // Create Vulkan surface immediately if possible, but ignore
     // certain errors since the app window may still be in use in
@@ -587,20 +574,6 @@ namespace dxvk {
   }
 
 
-  void Presenter::setFullScreenExclusiveMode(VkFullScreenExclusiveEXT mode) {
-    std::lock_guard lock(m_surfaceMutex);
-
-    // FSE remains opt-in; without the option every swapchain stays disallowed.
-    if (!m_device->config().allowFse)
-      mode = VK_FULL_SCREEN_EXCLUSIVE_DISALLOWED_EXT;
-
-    if (m_fullscreenMode != mode) {
-      m_fullscreenMode = mode;
-      m_dirtySwapchain = true;
-    }
-  }
-
-
   void Presenter::setFrameRateLimit(double frameRate, uint32_t maxLatency) {
     m_frameRateLimitLatency = maxLatency;
 
@@ -662,12 +635,11 @@ namespace dxvk {
     if (m_swapchain)
       destroySwapchain();
 
-    // Swapchain is now torn down — the window in which DLSS-G may be (un)loaded (Streamline DLSS-G guide
-    // §18). The host's callback calls slSetFeatureLoaded so the createSwapChain below installs/omits the
-    // DLSS-G present proxy. No-op for ordinary recreates (resize, FSR-FG wrap) — CS only changes the
-    // desired load state on a real DLSS-G select/deselect.
-    if (g_dxvkSwapchainTornDownCallback)
-      g_dxvkSwapchainTornDownCallback();
+    // Swapchain is now torn down — the window in which DLSS-G may be (un)loaded. The host's callback
+    // calls slSetFeatureLoaded so the createSwapChain below installs/omits the DLSS-G present proxy.
+    // No-op for ordinary recreates (resize, FSR-FG wrap).
+    if (auto cb = g_dxvkSwapchainTornDownCallback.load(std::memory_order_acquire))
+      cb();
 
     if (m_surface) {
       vr = createSwapChain();
@@ -926,9 +898,7 @@ namespace dxvk {
     // thin submit + hand-off (no second present loop) — query the registered predicate now.
     {
       auto query = g_dxvkFrameGenOwnsSwapchain.load(std::memory_order_acquire);
-      bool owned = query && m_swapchain && query(m_swapchain);
-      setFrameGenOwned(owned);
-      Logger::info(str::format("Presenter: frame-gen owned = ", owned, " (query ", (query != nullptr), ")"));
+      setFrameGenOwned(query && m_swapchain && query(m_swapchain));
     }
 
     // Import actual swap chain images

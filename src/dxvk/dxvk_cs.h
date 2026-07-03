@@ -12,12 +12,9 @@
 
 namespace dxvk {
 
-  // Larger chunks mean the render thread hands work to the CS thread less often,
-  // which directly cuts the render->CS queue-mutex contention and condvar-notify
-  // traffic (dispatchChunk). In a CPU-bound scene the render thread is the
-  // bottleneck and the CS thread has spare headroom, so the small extra dispatch
-  // latency is free while the reduced sync cost is a net win. (Upstream default
-  // is 16384.)
+  // Larger chunks dispatch to the CS thread less often, cutting render->CS queue-mutex
+  // contention and condvar-notify traffic. In a CPU-bound scene the render thread is the
+  // bottleneck, so the extra dispatch latency is free while the reduced sync cost is a win.
   constexpr static size_t DxvkCsChunkSize = 65536;
 
   /**
