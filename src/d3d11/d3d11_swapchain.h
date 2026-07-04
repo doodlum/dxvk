@@ -113,6 +113,15 @@ namespace dxvk {
     small_vector<Com<D3D11Texture2D, false>, 4> m_backBuffers;
 
     uint64_t                  m_frameId      = DXGI_MAX_SWAP_CHAIN_BUFFERS;
+
+    // Synchronous present (DXVK_SYNC_PRESENT=1): the app thread blocks until the submit thread
+    // executed the real vkQueuePresentKHR for this frame. Restores the reference Streamline
+    // sample's property that Present() IS the real present — every bit of the SL interposer's
+    // CPU-side per-frame bookkeeping observes the app quiescent at the presented frame. Unlike
+    // the DLSS-G evaluate waitIdle this is a CPU/thread drain, not a GPU fence wait.
+    bool                      m_syncPresent  = false;
+    DxvkSubmitStatus          m_presentStatus;
+
     uint32_t                  m_frameLatency = DefaultFrameLatency;
     uint32_t                  m_frameLatencyCap = 0;
     HANDLE                    m_frameLatencyEvent = nullptr;

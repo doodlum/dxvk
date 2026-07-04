@@ -66,6 +66,10 @@ namespace dxvk {
     m_desc(*pDesc),
     m_device(pDevice->GetDXVKDevice()),
     m_frameLatencyCap(pDevice->GetOptions()->maxFrameLatency) {
+    if (const char* v = std::getenv("DXVK_SYNC_PRESENT"); v && v[0] == '1') {
+      m_syncPresent = true;
+      Logger::info("D3D11SwapChain: synchronous present enabled (DXVK_SYNC_PRESENT=1)");
+    }
     CreateFrameLatencyEvent();
     CreatePresenter();
     CreateBackBuffers();
@@ -416,6 +420,14 @@ namespace dxvk {
     viewInfo.layerIndex = 0u;
     viewInfo.layerCount = 1u;
 
+    // Synchronous present: arm the status BEFORE queuing the CS chunk; the submission queue
+    // flips it (and notifies) once the real vkQueuePresentKHR executed on the submit thread.
+    DxvkSubmitStatus* presentStatus = nullptr;
+    if (m_syncPresent) {
+      m_presentStatus.result.store(VK_NOT_READY);
+      presentStatus = &m_presentStatus;
+    }
+
     immediateContext->EmitCs([
       cDevice         = m_device,
       cBlitter        = m_blitter,
@@ -425,7 +437,8 @@ namespace dxvk {
       cPresenter      = m_presenter,
       cLatency        = m_latency,
       cColorSpace     = m_colorSpace,
-      cFrameId        = m_frameId
+      cFrameId        = m_frameId,
+      cPresentStatus  = presentStatus
     ] (DxvkContext* ctx) {
       // Update back buffer color space as necessary
       if (cSwapImage->image()->info().colorSpace != cColorSpace) {
@@ -447,13 +460,20 @@ namespace dxvk {
       ctx->synchronizeWsi(cSync);
       ctx->flushCommandList(nullptr, nullptr);
 
-      cDevice->presentImage(cPresenter, cLatency, cFrameId, nullptr);
+      cDevice->presentImage(cPresenter, cLatency, cFrameId, cPresentStatus);
     });
 
     if (m_backBuffers.size() > 1u)
       RotateBackBuffers(immediateContext);
 
     immediateContext->FlushCsChunk();
+
+    // Synchronous present: block this (the app's render) thread until the submit thread executed
+    // the real vkQueuePresentKHR. CPU-side drain only — no GPU fence is waited. This pins every
+    // SL-interposer present callback to a moment where the app is quiescent at the presented
+    // frame, the reference Streamline sample's implicit property.
+    if (presentStatus)
+      m_device->waitForSubmission(presentStatus);
 
     if (m_latency) {
       m_latency->notifyCpuPresentEnd(m_frameId);
