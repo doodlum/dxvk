@@ -8,3 +8,5 @@ EXPORTS
     dxvkRequestSwapchainRecreate @101
     dxvkSetSwapchainTornDownCallback @102
     dxvkSetTargetFrameRate @103
+    dxvkSetPresentMarkerCallback @104
+    dxvkPushPresentAppFrameId @105

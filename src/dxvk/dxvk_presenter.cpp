@@ -10,20 +10,19 @@
 
 namespace dxvk {
 
-  // External FFX frame-generation ownership predicate, set by the external frame-gen host's WSI hook.
-  // Returns true for the external FFX frame-interpolation swapchain; when owned, the Presenter becomes
-  // a thin submit + hand-off and lets FFX own the present loop. Null => never owned.
+  // External FFX frame-generation ownership predicate, set by the CS WSI hook. Returns true for the
+  // external FFX frame-interpolation swapchain; when owned, the Presenter becomes a thin submit +
+  // hand-off and lets FFX own the present loop. Null => never owned.
   std::atomic<bool (*)(VkSwapchainKHR)> g_dxvkFrameGenOwnsSwapchain = { nullptr };
 
   extern "C" void dxvkSetFrameGenOwnershipQuery(bool (*query)(VkSwapchainKHR)) {
     g_dxvkFrameGenOwnsSwapchain.store(query, std::memory_order_release);
   }
 
-  // One-shot request to recreate the Vulkan swapchain on the next acquire. The external frame-gen host
-  // uses this when switching frame-generation methods: a sticky present proxy installed by one method
-  // bypasses the Vulkan present hooks, so the other method never returns VK_SUBOPTIMAL to trigger a
-  // recreate. A DXVK-internal recreate preserves the D3D11 back buffers and re-runs
-  // vkCreate/DestroySwapchainKHR, releasing the proxy.
+  // One-shot request to recreate the Vulkan swapchain on the next acquire. CS uses this on a DLSS-G ->
+  // FSR frame-gen switch: sl.dlss_g's sticky present proxy bypasses the Vulkan present hooks, so FSR
+  // never returns VK_SUBOPTIMAL to trigger a recreate. A DXVK-internal recreate preserves the D3D11
+  // back buffers and re-runs vkCreate/DestroySwapchainKHR, releasing the proxy.
   std::atomic<bool> g_dxvkForceSwapchainRecreate = { false };
 
   extern "C" void dxvkRequestSwapchainRecreate() {
@@ -31,22 +30,51 @@ namespace dxvk {
   }
 
   // Callback invoked inside recreateSwapChain() while no swapchain exists (after destroy, before create).
-  // Some external frame generators require their "feature loaded" toggle in exactly this window so the
-  // next vkCreateSwapchainKHR installs or omits their present proxy. Runs under m_surfaceMutex.
+  // The Streamline DLSS-G guide requires slSetFeatureLoaded in exactly this window so the next
+  // vkCreateSwapchainKHR installs or omits DLSS-G's present proxy. Runs under m_surfaceMutex.
   std::atomic<void (*)()> g_dxvkSwapchainTornDownCallback = { nullptr };
 
   extern "C" void dxvkSetSwapchainTornDownCallback(void (*cb)()) {
     g_dxvkSwapchainTornDownCallback.store(cb, std::memory_order_release);
   }
 
-  // External frame-rate cap, in fps, driven by the external frame-gen host to pace presents when nothing
-  // else does (some external frame generators force Reflex off, so they have no Reflex limiter).
-  // NaN => unset, 0 => unlimited, >0 => cap. Reconciled into m_fpsLimiter every present via
-  // applyExternalFrameRateLimit().
+  // External frame-rate cap, in fps, driven by CS to pace presents when nothing else does (FSR frame
+  // generation forces Reflex off, so it has no Reflex limiter). NaN => unset, 0 => unlimited, >0 => cap.
+  // Reconciled into m_fpsLimiter every present via applyExternalFrameRateLimit().
   std::atomic<double> g_dxvkExternalFrameRate = { std::numeric_limits<double>::quiet_NaN() };
 
   extern "C" void dxvkSetTargetFrameRate(double fps) {
     g_dxvkExternalFrameRate.store(fps < 0.0 ? 0.0 : fps, std::memory_order_release);
+  }
+
+  // Present-marker bridge for Streamline frame generation. The app's D3D11 Present call only
+  // QUEUES a present; the real vkQueuePresentKHR (where the SL interposer's present proxy runs
+  // interpolation) happens later on this submit thread. SL correlates that present with the
+  // app's most recent PresentStart PCL marker, so markers fired at the D3D11 call are stale by
+  // the time the present executes whenever the app runs ahead — SL then pairs the presented
+  // frame with the NEXT frame's camera constants. The bridge lets the app fire its present
+  // markers HERE, around the actual present, with the app frame id of the frame being presented:
+  // cb(appFrameId, phase) with phase 0 = before present, 1 = after.
+  std::atomic<void (*)(uint64_t, uint32_t)> g_dxvkPresentMarkerCallback = { nullptr };
+
+  extern "C" void dxvkSetPresentMarkerCallback(void (*cb)(uint64_t, uint32_t)) {
+    g_dxvkPresentMarkerCallback.store(cb, std::memory_order_release);
+  }
+
+  // FIFO of app frame ids for queued presents: the app pushes exactly one per D3D11 Present call
+  // (from its Present hook, render thread); presentImage pops one per actual present (submit
+  // thread). Presents are FIFO through the submission queue, so ordering holds; if the ring is
+  // empty (a present with no matching push, e.g. an internal recreate) the marker is skipped for
+  // that present rather than fired with a wrong id.
+  std::atomic<uint64_t> g_dxvkPresentAppFrameIds[16];
+  std::atomic<uint32_t> g_dxvkPresentAppFrameHead = { 0u };
+  std::atomic<uint32_t> g_dxvkPresentAppFrameTail = { 0u };
+
+  extern "C" void dxvkPushPresentAppFrameId(uint64_t id) {
+    uint32_t t = g_dxvkPresentAppFrameTail.load(std::memory_order_relaxed);
+    // Drop the oldest on overflow (bounded presents-in-flight make this unreachable in practice).
+    g_dxvkPresentAppFrameIds[t % 16u].store(id, std::memory_order_relaxed);
+    g_dxvkPresentAppFrameTail.store(t + 1u, std::memory_order_release);
   }
 
   const std::array<std::pair<VkColorSpaceKHR, VkColorSpaceKHR>, 2> Presenter::s_colorSpaceFallbacks = {{
@@ -213,7 +241,7 @@ namespace dxvk {
     }
 
     // Return relevant Vulkan objects for the acquired image.
-    // An externally-wrapped swapchain (the FFX FrameInterpolationSwapChain installed for external frame
+    // An externally-wrapped swapchain (the FFX FrameInterpolationSwapChain installed for FSR frame
     // generation) can recreate the underlying VkSwapchainKHR out from under us, leaving m_imageIndex /
     // m_frameIndex stale relative to our cached m_images / m_semaphores arrays — vkAcquireNextImageKHR
     // then hands back an index that no longer fits. Guard the .at() accesses: a stale index is treated as
@@ -274,8 +302,25 @@ namespace dxvk {
       fenceInfo.pNext = const_cast<void*>(std::exchange(info.pNext, &fenceInfo));
     }
 
+    // Pop the app frame id queued at the D3D11 Present call and bracket the REAL present with the
+    // app's present markers (see the bridge comment at the top of this file).
+    uint64_t appFrameId = 0;
+    {
+      uint32_t h = g_dxvkPresentAppFrameHead.load(std::memory_order_relaxed);
+      if (h != g_dxvkPresentAppFrameTail.load(std::memory_order_acquire)) {
+        appFrameId = g_dxvkPresentAppFrameIds[h % 16u].load(std::memory_order_relaxed);
+        g_dxvkPresentAppFrameHead.store(h + 1u, std::memory_order_relaxed);
+      }
+    }
+    auto* markerCb = g_dxvkPresentMarkerCallback.load(std::memory_order_acquire);
+    if (markerCb && appFrameId)
+      markerCb(appFrameId, 0u);
+
     VkResult status = m_vkd->vkQueuePresentKHR(
       m_device->queues().graphics.queueHandle, &info);
+
+    if (markerCb && appFrameId)
+      markerCb(appFrameId, 1u);
 
     // Maintain valid state if presentation succeeded, even if we want to
     // recreate the swapchain. Spec says that 'queue' operations, i.e. the
@@ -357,9 +402,8 @@ namespace dxvk {
     if (m_frameGenOwned.load()) {
       // Under full interposition every swapchain reports frame-gen-owned, so this is the ONLY present
       // path that runs and the two delay() sites below are dead. Apply the external frame-rate cap here
-      // so the external frame-gen host can limit present rate when nothing else paces it — notably
-      // external frame generation, which forces Reflex off and so has no Reflex limiter. No-op unless the
-      // host set a cap via dxvkSetTargetFrameRate.
+      // so CS can limit present rate when nothing else paces it — notably FSR frame generation, which
+      // forces Reflex off and so has no Reflex limiter. No-op unless CS set a cap via dxvkSetTargetFrameRate.
       applyExternalFrameRateLimit();
       m_fpsLimiter.delay();
 
@@ -580,7 +624,7 @@ namespace dxvk {
   void Presenter::setFrameRateLimit(double frameRate, uint32_t maxLatency) {
     m_frameRateLimitLatency = maxLatency;
 
-    // An active external cap (from the frame-gen host) takes precedence over the swapchain's DXGI target; don't let a swapchain
+    // An active external cap (CS) takes precedence over the swapchain's DXGI target; don't let a swapchain
     // re-push clobber it. applyExternalFrameRateLimit() re-asserts the override each present regardless.
     if (std::isnan(g_dxvkExternalFrameRate.load(std::memory_order_acquire)))
       m_fpsLimiter.setTargetFrameRate(frameRate, maxLatency);
@@ -638,9 +682,9 @@ namespace dxvk {
     if (m_swapchain)
       destroySwapchain();
 
-    // Swapchain is now torn down — the window in which an external frame generator may be (un)loaded. The
-    // external frame-gen host's callback toggles its "feature loaded" state so the createSwapChain below
-    // installs/omits its present proxy. No-op for ordinary recreates (resize, frame-gen wrap).
+    // Swapchain is now torn down — the window in which DLSS-G may be (un)loaded. The host's callback
+    // calls slSetFeatureLoaded so the createSwapChain below installs/omits the DLSS-G present proxy.
+    // No-op for ordinary recreates (resize, FSR-FG wrap).
     if (auto cb = g_dxvkSwapchainTornDownCallback.load(std::memory_order_acquire))
       cb();
 
@@ -663,9 +707,9 @@ namespace dxvk {
 
 
   void Presenter::updateSwapChain() {
-    // Honour a one-shot external recreate request (external frame-gen host method switch — see
+    // Honour a one-shot external recreate request (CS frame-gen method switch — see
     // g_dxvkForceSwapchainRecreate above). Treated as a dirty surface so the swapchain is fully torn
-    // down and rebuilt, evicting any sticky external present proxy on the way.
+    // down and rebuilt, evicting any sticky external present proxy (sl.dlss_g) on the way.
     if (g_dxvkForceSwapchainRecreate.exchange(false, std::memory_order_acq_rel))
       m_dirtySurface = true;
 
@@ -1420,7 +1464,7 @@ namespace dxvk {
 
     // Defense-in-depth: if the swapchain became FFX frame-generation-owned after this thread started
     // (e.g. FG toggled on), bail out — FFX owns present-wait/pacing and presentImage stops queuing
-    // frames here. A recreate (which the external frame-gen host forces on toggle) re-evaluates ownership at line ~902.
+    // frames here. A recreate (which CS forces on toggle) re-evaluates ownership at line ~902.
     if (m_frameGenOwned.load())
       return;
 
