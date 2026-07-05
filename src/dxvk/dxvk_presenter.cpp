@@ -82,6 +82,29 @@ namespace dxvk {
     g_dxvkSkipFrameLatencySync.store(skip != 0u, std::memory_order_release);
   }
 
+  // One-shot extra wait semaphore for the NEXT present (see presentImage). The producer pushes
+  // a semaphore its own submission signals; the presenter consumes it exactly once. Pushing
+  // while one is already pending replaces it (the presents are throttled by the same producer,
+  // so in practice at most one is in flight).
+  std::atomic<VkSemaphore> g_dxvkPresentExtraWaitSemaphore = { VK_NULL_HANDLE };
+
+  extern "C" void dxvkPushPresentWaitSemaphore(VkSemaphore sem) {
+    g_dxvkPresentExtraWaitSemaphore.store(sem, std::memory_order_release);
+  }
+
+  // Present-path override. Chaining VkSurfaceFullScreenExclusiveInfoEXT with DISALLOWED makes
+  // the NVIDIA ICD route presents through the compositor GDI-copy path; not chaining it (the
+  // spec default, and the dxvk default here via allowFse=false) yields hardware flips, which
+  // Streamline DLSS-G's pacer requires (its hardware present wedges on the copy path) and
+  // FSR-FG runs fine on. 1 = force chain (copy), 0 = force no-chain (flips), -1 = default.
+  // Note the asymmetry if ever forcing: the driver flip-locks a window at its first flip
+  // present, so copy is only reachable before any flip has occurred.
+  std::atomic<int32_t> g_dxvkFsePNextChainOverride = { -1 };
+
+  extern "C" void dxvkSetFsePNextChain(int32_t mode) {
+    g_dxvkFsePNextChainOverride.store(mode, std::memory_order_release);
+  }
+
   extern "C" void dxvkPushPresentAppFrameId(uint64_t id) {
     uint32_t t = g_dxvkPresentAppFrameTail.load(std::memory_order_relaxed);
     // Drop the oldest on overflow (bounded presents-in-flight make this unreachable in practice).
@@ -112,17 +135,7 @@ namespace dxvk {
       ? VK_FULL_SCREEN_EXCLUSIVE_ALLOWED_EXT
       : VK_FULL_SCREEN_EXCLUSIVE_DISALLOWED_EXT;
 
-    // Only chain VkSurfaceFullScreenExclusiveInfoEXT when FSE is actually opted into. Chaining
-    // an explicit DISALLOWED (the old unconditional behavior) makes the NVIDIA ICD treat the
-    // surface as compositor-only and route every present through the GDI-copy path — no flip
-    // chain, so DLSS-G's frame pacer wedges submitting its hardware present
-    // (NtDxgkSubmitPresentToHwQueue) and eBlockPresentingClientQueue deadlocks. Not chaining is
-    // the spec default and restores hardware flips (PresentMon: "Composed: Copy with GPU GDI"
-    // -> "Hardware: Legacy Flip"), measured against the Streamline sample, which chains nothing
-    // and presents via the flip model on the same machine/driver.
-    m_chainFseInfo = m_device->config().allowFse;
-    if (!m_chainFseInfo)
-      Logger::info("Presenter: FSE pNext not chained (flip-model presents; allowFse=false)");
+    updateFsePNextChainMode();
 
     // Create Vulkan surface immediately if possible, but ignore
     // certain errors since the app window may still be in use in
@@ -311,9 +324,19 @@ namespace dxvk {
     modeInfo.swapchainCount = 1;
     modeInfo.pPresentModes  = &m_presentMode;
 
+    // App-provided extra present-wait semaphore (dxvkPushPresentWaitSemaphore): queue-orders
+    // the present after external work the app submitted outside DXVK's own timeline — used by
+    // Streamline DLSS-G so its evaluate/tag submissions are GPU-ordered ahead of the present
+    // that reads them (pure queue sync, no CPU stall; the generated frames flash without it).
+    std::array<VkSemaphore, 2> waitSemaphores = { currSync.present, VK_NULL_HANDLE };
+    uint32_t waitSemaphoreCount = 1;
+
+    if (VkSemaphore extra = g_dxvkPresentExtraWaitSemaphore.exchange(VK_NULL_HANDLE, std::memory_order_acq_rel))
+      waitSemaphores[waitSemaphoreCount++] = extra;
+
     VkPresentInfoKHR info = { VK_STRUCTURE_TYPE_PRESENT_INFO_KHR };
-    info.waitSemaphoreCount = 1;
-    info.pWaitSemaphores    = &currSync.present;
+    info.waitSemaphoreCount = waitSemaphoreCount;
+    info.pWaitSemaphores    = waitSemaphores.data();
     info.swapchainCount     = 1;
     info.pSwapchains        = &m_swapchain;
     info.pImageIndices      = &m_imageIndex;
@@ -772,7 +795,30 @@ namespace dxvk {
   }
 
 
+  void Presenter::updateFsePNextChainMode() {
+    // Default: chain only when FSE is actually opted into — chaining an explicit DISALLOWED
+    // costs the hardware-flip present path (see g_dxvkFsePNextChainOverride).
+    bool chain = m_device->config().allowFse;
+
+    int32_t forced = g_dxvkFsePNextChainOverride.load(std::memory_order_acquire);
+    if (forced >= 0)
+      chain = forced != 0;
+
+    // A/B diagnostic override.
+    if (const char* v = std::getenv("DXVK_CHAIN_FSE"); v && v[0] == '1')
+      chain = true;
+
+    if (chain != m_chainFseInfo)
+      Logger::info(str::format("Presenter: FSE pNext ", chain ? "chained (copy-path presents)"
+                                                              : "not chained (flip-model presents)"));
+    m_chainFseInfo = chain;
+  }
+
+
   VkResult Presenter::createSwapChain() {
+    // The frame-generation method may have changed since the last (re)create.
+    updateFsePNextChainMode();
+
     VkSurfaceFullScreenExclusiveInfoEXT fullScreenExclusiveInfo = { VK_STRUCTURE_TYPE_SURFACE_FULL_SCREEN_EXCLUSIVE_INFO_EXT };
     fullScreenExclusiveInfo.fullScreenExclusive = m_fullscreenMode;
 

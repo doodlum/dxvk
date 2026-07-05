@@ -298,10 +298,13 @@ namespace dxvk {
 
     VkFullScreenExclusiveEXT    m_fullscreenMode = VK_FULL_SCREEN_EXCLUSIVE_DISALLOWED_EXT;
 
-    // Chain VkSurfaceFullScreenExclusiveInfoEXT into surface/swapchain queries. Disabled via
-    // DXVK_FSE_DEFAULT=1 to match apps that chain nothing (the explicit DISALLOWED value can
-    // route the NVIDIA ICD onto the GDI-copy present path instead of the flip model).
+    // Chain VkSurfaceFullScreenExclusiveInfoEXT into surface/swapchain queries. An explicit
+    // DISALLOWED chain routes the NVIDIA ICD onto the GDI-copy present path; omitting it (the
+    // spec default) yields hardware flips. Selected per frame-generation method via
+    // dxvkSetFsePNextChain and refreshed on every swapchain (re)create.
     bool                        m_chainFseInfo = true;
+
+    void updateFsePNextChainMode();
 
     std::vector<Rc<DxvkImage>>  m_images;
     std::vector<PresenterSync>  m_semaphores;
