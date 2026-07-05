@@ -70,6 +70,18 @@ namespace dxvk {
   std::atomic<uint32_t> g_dxvkPresentAppFrameHead = { 0u };
   std::atomic<uint32_t> g_dxvkPresentAppFrameTail = { 0u };
 
+  // Skip the D3D11 swapchain's frame-latency throttle (SyncFrameLatency). Set by the app while
+  // Streamline DLSS-G runs in eBlockPresentingClientQueue: SL paces the app by blocking inside
+  // the present itself, and DXVK's own latency wait then deadlocks the pipeline — its signal
+  // fires on the submit thread, which is parked inside SL's blocking present; the render thread
+  // starves waiting for it and can never deliver the next frame SL's block needs to release.
+  // With the throttle skipped, SL's block is the sole (and intended) pacing.
+  std::atomic<bool> g_dxvkSkipFrameLatencySync = { false };
+
+  extern "C" void dxvkSetSkipFrameLatencySync(uint32_t skip) {
+    g_dxvkSkipFrameLatencySync.store(skip != 0u, std::memory_order_release);
+  }
+
   extern "C" void dxvkPushPresentAppFrameId(uint64_t id) {
     uint32_t t = g_dxvkPresentAppFrameTail.load(std::memory_order_relaxed);
     // Drop the oldest on overflow (bounded presents-in-flight make this unreachable in practice).
@@ -290,7 +302,16 @@ namespace dxvk {
     // waitForSwapchainFence blocks on the unsignaled fence. Pass a clean VkPresentInfoKHR.
     bool fgOwned = m_frameGenOwned.load();
 
-    if (!fgOwned && frameId && m_hasPresentId) {
+    // VkPresentIdKHR: attached for normal presents, stripped for FFX-wrapped ones (FFX's
+    // replacement vkQueuePresentKHR chokes on the pNext structs). EXCEPTION: while Streamline
+    // DLSS-G runs in eBlockPresentingClientQueue (signalled via dxvkSetSkipFrameLatencySync),
+    // the present ID must be attached even though the swapchain is FG-owned — sl.dlss_g's frame
+    // pacer times the real-frame release off present-completion tracking, and without the ID its
+    // flush times out every frame ("Worker thread 'nv.sl.dlss_g.thread.pacer' timed out") and
+    // the blocking present wedges the pipeline.
+    bool dlssgBlocking = g_dxvkSkipFrameLatencySync.load(std::memory_order_acquire);
+
+    if ((!fgOwned || dlssgBlocking) && frameId && m_hasPresentId) {
       if (m_device->features().khrPresentId2.presentId2)
         presentId2.pNext = const_cast<void*>(std::exchange(info.pNext, &presentId2));
       else
@@ -316,8 +337,12 @@ namespace dxvk {
     if (markerCb && appFrameId)
       markerCb(appFrameId, 0u);
 
+    // Present on the DEDICATED present queue (second graphics-family queue when the hardware
+    // exposes one; aliases graphics otherwise). Only this call ever touches that queue, so it
+    // needs no lock — and Streamline DLSS-G's blocking present (eBlockPresentingClientQueue)
+    // then parks a driver queue-domain that submissions never share.
     VkResult status = m_vkd->vkQueuePresentKHR(
-      m_device->queues().graphics.queueHandle, &info);
+      m_device->queues().present.queueHandle, &info);
 
     if (markerCb && appFrameId)
       markerCb(appFrameId, 1u);
@@ -1304,8 +1329,17 @@ namespace dxvk {
 
     Tristate tearFree = m_device->config().tearFree;
 
+    // TEST (SL blocking mode): prefer MAILBOX over IMMEDIATE while DLSS-G's
+    // eBlockPresentingClientQueue runs (signalled via dxvkSetSkipFrameLatencySync). The DLSS-G
+    // pacer wedges in NtDxgkSubmitPresentToHwQueue under IMMEDIATE (hardware present queue never
+    // retires deterministically); MAILBOX retires flips on vblank without SL seeing vsync-on.
+    const bool dlssgBlocking = g_dxvkSkipFrameLatencySync.load(std::memory_order_acquire);
+
     if (!syncInterval) {
-      if (tearFree != Tristate::True)
+      // MAILBOX is forced (IMMEDIATE skipped) while SL's DLSS-G blocking mode is flagged — note
+      // the flag only affects swapchains created after it flips; tested and INSUFFICIENT for the
+      // pacer wedge anyway (NtDxgkSubmitPresentToHwQueue stall is present-mode-independent).
+      if (!dlssgBlocking && tearFree != Tristate::True)
         desired[numDesired++] = VK_PRESENT_MODE_IMMEDIATE_KHR;
       desired[numDesired++] = VK_PRESENT_MODE_MAILBOX_KHR;
     } else {

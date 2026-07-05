@@ -10,3 +10,4 @@ EXPORTS
     dxvkSetTargetFrameRate @103
     dxvkSetPresentMarkerCallback @104
     dxvkPushPresentAppFrameId @105
+    dxvkSetSkipFrameLatencySync @106

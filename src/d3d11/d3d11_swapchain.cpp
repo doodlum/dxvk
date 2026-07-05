@@ -8,6 +8,9 @@
 
 namespace dxvk {
 
+  // Defined in dxvk_presenter.cpp (dxvkSetSkipFrameLatencySync export).
+  extern std::atomic<bool> g_dxvkSkipFrameLatencySync;
+
   static uint16_t MapGammaControlPoint(float x) {
     if (x < 0.0f) x = 0.0f;
     if (x > 1.0f) x = 1.0f;
@@ -647,6 +650,12 @@ namespace dxvk {
 
 
   void D3D11SwapChain::SyncFrameLatency() {
+    // App-requested skip (dxvkSetSkipFrameLatencySync): under Streamline DLSS-G's
+    // eBlockPresentingClientQueue the blocking present itself paces the app, and this wait
+    // deadlocks the pipeline (its signal fires on the submit thread, which SL's block parks).
+    if (g_dxvkSkipFrameLatencySync.load(std::memory_order_acquire))
+      return;
+
     // Wait for the sync event so that we respect the maximum frame latency
     m_frameLatencySignal->wait(m_frameId - GetActualFrameLatency());
 
