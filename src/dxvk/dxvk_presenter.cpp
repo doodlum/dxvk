@@ -112,6 +112,18 @@ namespace dxvk {
       ? VK_FULL_SCREEN_EXCLUSIVE_ALLOWED_EXT
       : VK_FULL_SCREEN_EXCLUSIVE_DISALLOWED_EXT;
 
+    // Only chain VkSurfaceFullScreenExclusiveInfoEXT when FSE is actually opted into. Chaining
+    // an explicit DISALLOWED (the old unconditional behavior) makes the NVIDIA ICD treat the
+    // surface as compositor-only and route every present through the GDI-copy path — no flip
+    // chain, so DLSS-G's frame pacer wedges submitting its hardware present
+    // (NtDxgkSubmitPresentToHwQueue) and eBlockPresentingClientQueue deadlocks. Not chaining is
+    // the spec default and restores hardware flips (PresentMon: "Composed: Copy with GPU GDI"
+    // -> "Hardware: Legacy Flip"), measured against the Streamline sample, which chains nothing
+    // and presents via the flip model on the same machine/driver.
+    m_chainFseInfo = m_device->config().allowFse;
+    if (!m_chainFseInfo)
+      Logger::info("Presenter: FSE pNext not chained (flip-model presents; allowFse=false)");
+
     // Create Vulkan surface immediately if possible, but ignore
     // certain errors since the app window may still be in use in
     // some way at this point, e.g. by a different device.
@@ -125,6 +137,16 @@ namespace dxvk {
     // KHR and EXT variants of this extension are completely identical
     m_hasSwapchainMaintenance1 = m_device->features().khrSwapchainMaintenance1.swapchainMaintenance1
                               || m_device->features().extSwapchainMaintenance1.swapchainMaintenance1;
+
+    // TEST round 16 (DXVK_NO_SWAPCHAIN_MAINT=1): create plain swapchains like the Streamline
+    // sample. The sl.dlss_g pacer's flip metering never reaches its 'good' FC feedback state
+    // against DXVK's maintenance1 swapchains (present-modes pNext / dynamic mode switching),
+    // and the eBlockPresentingClientQueue present then wedges waiting the pacer flush. The
+    // sample's plain swapchain achieves 'good' in ~300ms and interpolation doubles.
+    if (const char* v = std::getenv("DXVK_NO_SWAPCHAIN_MAINT"); v && v[0] == '1') {
+      m_hasSwapchainMaintenance1 = false;
+      Logger::info("Presenter: swapchain_maintenance1 disabled (DXVK_NO_SWAPCHAIN_MAINT=1)");
+    }
 
     // Gamescope WSI is currently broken and doesn't properly signal
     // the present fence if presentation is queued but fails.
@@ -757,7 +779,7 @@ namespace dxvk {
     VkPhysicalDeviceSurfaceInfo2KHR surfaceInfo = { VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SURFACE_INFO_2_KHR };
     surfaceInfo.surface = m_surface;
 
-    if (m_device->features().extFullScreenExclusive)
+    if (m_device->features().extFullScreenExclusive && m_chainFseInfo)
       surfaceInfo.pNext = &fullScreenExclusiveInfo;
 
     // Query surface capabilities. Some properties might have changed,
@@ -932,7 +954,16 @@ namespace dxvk {
     swapInfo.presentMode            = m_presentMode;
     swapInfo.clipped                = VK_TRUE;
 
-    if (m_device->features().khrSwapchainMutableFormat && formatList.viewFormatCount) {
+    // TEST round 17 (DXVK_NO_MUTABLE_SWAPCHAIN=1): plain-format swapchain like the Streamline
+    // sample. Mutable-format swapchain images can lose direct-flip eligibility, and sl.dlss_g's
+    // pacer wedges submitting its hardware present (NtDxgkSubmitPresentToHwQueue) — the pacer
+    // needs flippable images.
+    static const bool noMutable = [] {
+      const char* v = std::getenv("DXVK_NO_MUTABLE_SWAPCHAIN");
+      return v && v[0] == '1';
+    }();
+
+    if (!noMutable && m_device->features().khrSwapchainMutableFormat && formatList.viewFormatCount) {
       swapInfo.flags |= VK_SWAPCHAIN_CREATE_MUTABLE_FORMAT_BIT_KHR;
       formatList.pNext = std::exchange(swapInfo.pNext, &formatList);
     }
@@ -943,7 +974,7 @@ namespace dxvk {
     if (presentWait2Caps.presentWait2Supported)
       swapInfo.flags |= VK_SWAPCHAIN_CREATE_PRESENT_WAIT_2_BIT_KHR;
 
-    if (m_device->features().extFullScreenExclusive)
+    if (m_device->features().extFullScreenExclusive && m_chainFseInfo)
       fullScreenInfo.pNext = const_cast<void*>(std::exchange(swapInfo.pNext, &fullScreenInfo));
 
     if (m_hasSwapchainMaintenance1)
@@ -1075,7 +1106,9 @@ namespace dxvk {
     VkSurfaceFullScreenExclusiveInfoEXT fullScreenInfo = { VK_STRUCTURE_TYPE_SURFACE_FULL_SCREEN_EXCLUSIVE_INFO_EXT };
     fullScreenInfo.fullScreenExclusive = m_fullscreenMode;
 
-    VkPhysicalDeviceSurfaceInfo2KHR surfaceInfo = { VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SURFACE_INFO_2_KHR, &fullScreenInfo };
+    VkPhysicalDeviceSurfaceInfo2KHR surfaceInfo = { VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SURFACE_INFO_2_KHR };
+    if (m_chainFseInfo)
+      surfaceInfo.pNext = &fullScreenInfo;
     surfaceInfo.surface = m_surface;
 
     VkResult status;
@@ -1122,7 +1155,9 @@ namespace dxvk {
     VkSurfaceFullScreenExclusiveInfoEXT fullScreenInfo = { VK_STRUCTURE_TYPE_SURFACE_FULL_SCREEN_EXCLUSIVE_INFO_EXT };
     fullScreenInfo.fullScreenExclusive = m_fullscreenMode;
 
-    VkPhysicalDeviceSurfaceInfo2KHR surfaceInfo = { VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SURFACE_INFO_2_KHR, &fullScreenInfo };
+    VkPhysicalDeviceSurfaceInfo2KHR surfaceInfo = { VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SURFACE_INFO_2_KHR };
+    if (m_chainFseInfo)
+      surfaceInfo.pNext = &fullScreenInfo;
     surfaceInfo.surface = m_surface;
 
     VkResult status;

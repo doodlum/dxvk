@@ -146,12 +146,12 @@ namespace dxvk {
       const Rc<DxvkLatencyTracker>& tracker);
 
     /**
-     * \brief Marks this swapchain as owned by an external frame-generation layer (FFX frame interpolation)
+     * \brief Marks this swapchain as owned by an external frame-generation layer (FFX FSR3)
      *
      * When set, the Presenter acts as a thin submit + hand-off: it does NOT run its own
      * present-wait worker, does NOT acquire the next image after presenting, and signals the
      * frame-latency event immediately on the submit thread. This leaves the external frame-gen
-     * swapchain (FFX) as the single owner of the present loop — matching the FFX
+     * swapchain (FFX) as the single owner of the present loop — matching the official FSR3
      * frame-interpolation-swapchain model and avoiding a stacked-present-loop deadlock. Set
      * automatically at swapchain creation via the dxvkSetFrameGenOwnershipQuery predicate.
      */
@@ -297,6 +297,11 @@ namespace dxvk {
     VkSwapchainKHR              m_swapchain   = VK_NULL_HANDLE;
 
     VkFullScreenExclusiveEXT    m_fullscreenMode = VK_FULL_SCREEN_EXCLUSIVE_DISALLOWED_EXT;
+
+    // Chain VkSurfaceFullScreenExclusiveInfoEXT into surface/swapchain queries. Disabled via
+    // DXVK_FSE_DEFAULT=1 to match apps that chain nothing (the explicit DISALLOWED value can
+    // route the NVIDIA ICD onto the GDI-copy present path instead of the flip model).
+    bool                        m_chainFseInfo = true;
 
     std::vector<Rc<DxvkImage>>  m_images;
     std::vector<PresenterSync>  m_semaphores;
