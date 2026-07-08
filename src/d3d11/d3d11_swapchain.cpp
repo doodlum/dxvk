@@ -11,13 +11,15 @@ namespace dxvk {
   // Defined in dxvk_presenter.cpp (dxvkSetSkipFrameLatencySync export).
   extern std::atomic<bool> g_dxvkSkipFrameLatencySync;
 
-  // Synchronous present (dxvkSetSyncPresent, @110). CS sets this before the swapchain is created to
-  // force the render thread to WAIT for the real vkQueuePresentKHR (matches the Streamline sample's
-  // synchronous present). Default DXVK present is async — the D3D11 Present hook only QUEUES the present
-  // onto the submit thread, so CS's occlusion skip can't stop an already-queued DLSS-G present that hangs
-  // on a composited surface. This global is the reliable delivery path: SetEnvironmentVariable does NOT
-  // reach DXVK's separate CRT std::getenv, so the DXVK_SYNC_PRESENT env var only works when set in the
-  // process env before launch; CS uses this export instead.
+  // Synchronous present (dxvkSetSyncPresent, @110), read LIVE per-present in PresentImage. The host
+  // (CS) keeps it ON exactly while a frame-generation present proxy is active: sync present forces the
+  // render thread to WAIT for the real vkQueuePresentKHR (matches the Streamline sample's synchronous
+  // present), so a DLSS-G/FFX present is never in flight past the D3D11 hook — the alt-tab safety
+  // property. Default DXVK present is async — the D3D11 Present hook only QUEUES the present onto the
+  // submit thread — which is both safe and FASTER when no FG proxy is present, so CS turns sync OFF
+  // with frame generation off. This global is the reliable delivery path: SetEnvironmentVariable does
+  // NOT reach DXVK's separate CRT std::getenv, so the DXVK_SYNC_PRESENT env var only works when set in
+  // the process env before launch; CS uses this export instead.
   std::atomic<bool> g_dxvkSyncPresent = { false };
 
   extern "C" void dxvkSetSyncPresent(uint32_t on) {
@@ -82,10 +84,13 @@ namespace dxvk {
     m_desc(*pDesc),
     m_device(pDevice->GetDXVKDevice()),
     m_frameLatencyCap(pDevice->GetOptions()->maxFrameLatency) {
+    // DXVK_SYNC_PRESENT env forces synchronous present for the swapchain's whole lifetime.
+    // The dxvkSetSyncPresent export is deliberately NOT baked here — PresentImage reads
+    // g_dxvkSyncPresent per-present so the host toggles it live with the FG state.
     const char* envSync = std::getenv("DXVK_SYNC_PRESENT");
-    if (g_dxvkSyncPresent.load(std::memory_order_acquire) || (envSync && envSync[0] == '1')) {
+    if (envSync && envSync[0] == '1') {
       m_syncPresent = true;
-      Logger::info("D3D11SwapChain: synchronous present enabled (dxvkSetSyncPresent/DXVK_SYNC_PRESENT)");
+      Logger::info("D3D11SwapChain: synchronous present forced (DXVK_SYNC_PRESENT)");
     }
     CreateFrameLatencyEvent();
     CreatePresenter();
@@ -439,8 +444,13 @@ namespace dxvk {
 
     // Synchronous present: arm the status BEFORE queuing the CS chunk; the submission queue
     // flips it (and notifies) once the real vkQueuePresentKHR executed on the submit thread.
+    // g_dxvkSyncPresent is read PER-PRESENT (not baked at swapchain creation) so the host can
+    // toggle it live with the frame-generation state: sync present exists for the FG present
+    // proxies (a DLSS-G/FFX present must never be in flight past the D3D11 hook), and paying
+    // its render-thread wait with frame generation OFF is pure overhead — stock async present
+    // is safe there. m_syncPresent (DXVK_SYNC_PRESENT env) still forces it on unconditionally.
     DxvkSubmitStatus* presentStatus = nullptr;
-    if (m_syncPresent) {
+    if (m_syncPresent || g_dxvkSyncPresent.load(std::memory_order_acquire)) {
       m_presentStatus.result.store(VK_NOT_READY);
       presentStatus = &m_presentStatus;
     }
