@@ -783,9 +783,21 @@ namespace dxvk {
     // arrays rather than intrusive linked lists: a list pop dereferences the next-pointer
     // inside the cold object, one serial cache-line miss per allocation on the per-draw
     // discard path. Slot-array pops touch a single dense line and prefetch cold objects by
-    // index. A small fixed cap (not PoolCapacityInBytes / MinSize = 1024) keeps the arrays
-    // cache-resident.
-    constexpr static uint32_t BatchCapacity = 64u;
+    // index. This cap also bounds the recycling depth per size class, since the shared
+    // cache free-list capacity is min(computePreferredAllocationCount, BatchCapacity).
+    //
+    // Skyrim (and other heavy CPU/draw-call D3D11 titles) Map/DISCARD ~21k dynamic
+    // constant buffers per frame, virtually all in the smallest (256 B = MinSize) size
+    // class, whose preferred count is 1024. Live render-thread IP-sampling showed the
+    // per-draw DISCARD path bottoms out in the allocator (allocateStorageWithMapPtr ->
+    // refillAllocationCache -> allocateDedicatedMemory) because a 64-deep recycle buffer
+    // underflows against that traffic, forcing the locked global-alloc path hundreds of
+    // times per frame. Raising the cap deepens recycling for the small classes that need
+    // it; large classes are unaffected because min(preferredCount, BatchCapacity) already
+    // pins them low (e.g. the 128 KiB class keeps 2). LIFO pops still prefetch a few slots
+    // ahead of use, so a larger backing array does not hurt pop locality. Slot is 16 B, so
+    // even the 256-entry arrays are 4 KiB.
+    constexpr static uint32_t BatchCapacity = 256u;
 
     /**
      * \brief Cached allocation slot
