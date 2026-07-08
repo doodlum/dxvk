@@ -13,3 +13,4 @@ EXPORTS
     dxvkSetSkipFrameLatencySync @106
     dxvkSetFsePNextChain @107
     dxvkPushPresentWaitSemaphore @108
+    dxvkSetSyncPresent @110

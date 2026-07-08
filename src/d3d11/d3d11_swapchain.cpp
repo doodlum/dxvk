@@ -11,6 +11,19 @@ namespace dxvk {
   // Defined in dxvk_presenter.cpp (dxvkSetSkipFrameLatencySync export).
   extern std::atomic<bool> g_dxvkSkipFrameLatencySync;
 
+  // Synchronous present (dxvkSetSyncPresent, @110). CS sets this before the swapchain is created to
+  // force the render thread to WAIT for the real vkQueuePresentKHR (matches the Streamline sample's
+  // synchronous present). Default DXVK present is async — the D3D11 Present hook only QUEUES the present
+  // onto the submit thread, so CS's occlusion skip can't stop an already-queued DLSS-G present that hangs
+  // on a composited surface. This global is the reliable delivery path: SetEnvironmentVariable does NOT
+  // reach DXVK's separate CRT std::getenv, so the DXVK_SYNC_PRESENT env var only works when set in the
+  // process env before launch; CS uses this export instead.
+  std::atomic<bool> g_dxvkSyncPresent = { false };
+
+  extern "C" void dxvkSetSyncPresent(uint32_t on) {
+    g_dxvkSyncPresent.store(on != 0u, std::memory_order_release);
+  }
+
   static uint16_t MapGammaControlPoint(float x) {
     if (x < 0.0f) x = 0.0f;
     if (x > 1.0f) x = 1.0f;
@@ -69,9 +82,10 @@ namespace dxvk {
     m_desc(*pDesc),
     m_device(pDevice->GetDXVKDevice()),
     m_frameLatencyCap(pDevice->GetOptions()->maxFrameLatency) {
-    if (const char* v = std::getenv("DXVK_SYNC_PRESENT"); v && v[0] == '1') {
+    const char* envSync = std::getenv("DXVK_SYNC_PRESENT");
+    if (g_dxvkSyncPresent.load(std::memory_order_acquire) || (envSync && envSync[0] == '1')) {
       m_syncPresent = true;
-      Logger::info("D3D11SwapChain: synchronous present enabled (DXVK_SYNC_PRESENT=1)");
+      Logger::info("D3D11SwapChain: synchronous present enabled (dxvkSetSyncPresent/DXVK_SYNC_PRESENT)");
     }
     CreateFrameLatencyEvent();
     CreatePresenter();
